@@ -4,6 +4,14 @@
   "main": "./src/index.ts",
   "compatibility_date": "2026-11-03",
   "workers_dev": true,
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hermes-mini-db",
+      "database_id": "2c5344ce-b5a9-4c82-bbc7-0eba7ad98155",
+      "migrations_dir": "migrations"
+    }
+  ],
   "observability": {
     "enabled": true
   }

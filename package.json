@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "db:migrations:list:remote": "wrangler d1 migrations list hermes-mini-db --remote",
+    "db:migrations:apply:remote": "wrangler d1 migrations apply hermes-mini-db --remote"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261103.1",
