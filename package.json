@@ -7,10 +7,12 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:migrations:list:remote": "wrangler d1 migrations list hermes-mini-db --remote",
-    "db:migrations:apply:remote": "wrangler d1 migrations apply hermes-mini-db --remote"
+    "db:migrations:apply:remote": "wrangler d1 migrations apply hermes-mini-db --remote",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261103.1",
+    "typescript": "7.0.2",
     "wrangler": "^4.42.0"
   }
 }

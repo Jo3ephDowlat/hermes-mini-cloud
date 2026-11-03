@@ -4,6 +4,10 @@
   "main": "./src/index.ts",
   "compatibility_date": "2026-11-03",
   "workers_dev": true,
+  "vars": {
+    "LLM_API_URL": "https://api.cloudflare.com/client/v4/accounts/8ab1187a292bbc0c00ad123c38607c57/ai/v1/chat/completions",
+    "LLM_MODEL": "@cf/qwen/qwen3-30b-a3b-fp8"
+  },
   "d1_databases": [
     {
       "binding": "DB",
