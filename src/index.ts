@@ -22,6 +22,8 @@ const REMINDER_BATCH_SIZE = 20;
 const REMINDER_STALE_CLAIM_SECONDS = 960; // 16 min — a Cron invocation may legally run up to 15 min
 const REMINDER_MAX_ATTEMPTS = 5;
 const REMINDER_RETRY_BACKOFF_SECONDS = 60; // multiplied by the attempt number (linear backoff)
+const MAX_TELEGRAM_VOICE_DURATION_SECONDS = 60;
+const MAX_TELEGRAM_FILE_BYTES = 20 * 1024 * 1024; // Telegram Bot API getFile limit
 
 const FALLBACK_REPLY = "متأسفم، متوجه درخواست شما نشدم. لطفاً دوباره تلاش کنید.";
 
@@ -66,11 +68,19 @@ interface TelegramChat {
 	type: string;
 }
 
+interface TelegramVoice {
+	file_id: string;
+	duration: number;
+	mime_type?: string;
+	file_size?: number;
+}
+
 interface TelegramMessage {
 	message_id: number;
 	from?: TelegramUser;
 	chat: TelegramChat;
 	text?: string;
+	voice?: TelegramVoice;
 }
 
 interface TelegramUpdate {
@@ -807,6 +817,72 @@ async function processMessage(env: Env, userId: string, chatId: number, text: st
 	await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, reply);
 }
 
+// ---------- Telegram voice transcription (v2, optional input path) ----------
+
+export async function transcribeTelegramVoice(env: Env, voice: TelegramVoice): Promise<string> {
+	if (!voice.file_id || !Number.isInteger(voice.duration) || voice.duration < 1 || voice.duration > MAX_TELEGRAM_VOICE_DURATION_SECONDS) {
+		throw new Error("Unsupported Telegram voice duration or file id");
+	}
+	if (voice.file_size !== undefined && voice.file_size > MAX_TELEGRAM_FILE_BYTES) {
+		throw new Error("Telegram voice file exceeds the download limit");
+	}
+
+	const fileInfoResponse = await fetch(
+		`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(voice.file_id)}`,
+		{ signal: AbortSignal.timeout(15_000) }
+	);
+	if (!fileInfoResponse.ok) throw new Error(`Telegram getFile HTTP ${fileInfoResponse.status}`);
+
+	const fileInfo = await fileInfoResponse.json<{
+		ok: boolean;
+		result?: { file_path?: string; file_size?: number };
+	}>();
+	const filePath = fileInfo.result?.file_path;
+	if (!fileInfo.ok || !filePath) throw new Error("Telegram did not return a voice file path");
+	if (fileInfo.result?.file_size !== undefined && fileInfo.result.file_size > MAX_TELEGRAM_FILE_BYTES) {
+		throw new Error("Telegram voice file exceeds the download limit");
+	}
+
+	const audioResponse = await fetch(
+		`https://api.telegram.org/file/bot${env.TELEGRAM_BOT_TOKEN}/${filePath}`,
+		{ signal: AbortSignal.timeout(20_000) }
+	);
+	if (!audioResponse.ok) throw new Error(`Telegram voice download HTTP ${audioResponse.status}`);
+
+	const audioBytes = await audioResponse.arrayBuffer();
+	if (audioBytes.byteLength === 0 || audioBytes.byteLength > MAX_TELEGRAM_FILE_BYTES) {
+		throw new Error("Invalid Telegram voice file size");
+	}
+
+	// Reuse the existing Cloudflare account endpoint and Workers AI token.
+	const whisperUrl = env.LLM_API_URL.replace(
+		/\/ai\/v1\/chat\/completions\/?$/,
+		"/ai/run/@cf/openai/whisper"
+	);
+	if (whisperUrl === env.LLM_API_URL) throw new Error("Could not derive the Workers AI Whisper endpoint");
+
+	const whisperResponse = await fetch(whisperUrl, {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${env.LLM_API_KEY}`,
+			"Content-Type": "application/octet-stream",
+		},
+		body: audioBytes,
+		signal: AbortSignal.timeout(60_000),
+	});
+	if (!whisperResponse.ok) throw new Error(`Workers AI Whisper HTTP ${whisperResponse.status}`);
+
+	const transcriptionResult = await whisperResponse.json<{
+		success?: boolean;
+		result?: { text?: string };
+	}>();
+	const transcription = transcriptionResult.result?.text?.trim();
+	if (transcriptionResult.success === false || !transcription) {
+		throw new Error("Workers AI Whisper returned an empty transcription");
+	}
+	return transcription.slice(0, MAX_MESSAGE_LENGTH);
+}
+
 async function sendTelegramMessageResult(token: string, chatId: number, text: string): Promise<boolean> {
 	try {
 		const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
@@ -846,8 +922,13 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 	}
 
 	const msg = update.message;
-	if (!msg || !msg.from || msg.chat?.type !== "private" || typeof msg.text !== "string" || msg.text.trim().length === 0) {
-		return jsonResponse({ ok: true }); // nothing processable; nothing stored
+	if (!msg || !msg.from || msg.chat?.type !== "private") {
+		return jsonResponse({ ok: true }); // unsupported update; nothing stored
+	}
+	const incomingText = typeof msg.text === "string" ? msg.text.trim() : "";
+	const voice = msg.voice;
+	if (!incomingText && !voice?.file_id) {
+		return jsonResponse({ ok: true }); // unsupported message type; nothing stored
 	}
 
 	// Whitelist check BEFORE claiming: unauthorized users never create
@@ -868,7 +949,17 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 		await env.DB.prepare("DELETE FROM pending_clarifications WHERE expires_at <= datetime('now')").run();
 		await env.DB.prepare("DELETE FROM processed_updates WHERE processed_at <= datetime('now', '-7 days')").run();
 
-		await processMessage(env, userId, msg.chat.id, msg.text.trim().slice(0, MAX_MESSAGE_LENGTH), update.update_id);
+		if (incomingText) {
+			// Existing text-message path is unchanged.
+			await processMessage(env, userId, msg.chat.id, incomingText.slice(0, MAX_MESSAGE_LENGTH), update.update_id);
+		} else if (voice) {
+			if (voice.duration > MAX_TELEGRAM_VOICE_DURATION_SECONDS) {
+				await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, msg.chat.id, "لطفاً پیام صوتی حداکثر ۶۰ ثانیه‌ای بفرست.");
+				return jsonResponse({ ok: true });
+			}
+			const transcription = await transcribeTelegramVoice(env, voice);
+			await processMessage(env, userId, msg.chat.id, transcription, update.update_id);
+		}
 	} catch (error) {
 		// Transient failure before any user-data mutation (auth, LLM, DB hiccups):
 		// release the claim and answer 500 so Telegram redelivers the update.
