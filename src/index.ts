@@ -786,7 +786,7 @@ export async function handleUserMessage(env: Env, userId: string, text: string, 
 		case "chat":
 			return parsed.reply ?? FALLBACK_REPLY;
 		case "remind":
-			return executeReminder(env, userId, parsed);
+			return executeReminder(env, userId, parsed, text);
 	}
 }
 
@@ -881,6 +881,76 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 
 // ---------- Natural-language reminders (v2, phase 1) ----------
 
+const PERSIAN_NUMBER_WORDS: Record<string, number> = {
+	صفر: 0, یک: 1, یه: 1, دو: 2, سه: 3, چهار: 4, پنج: 5, شش: 6, شیش: 6, هفت: 7,
+	هشت: 8, نه: 9, ده: 10, یازده: 11, دوازده: 12, سیزده: 13, چهارده: 14, پانزده: 15,
+	پونزده: 15, شانزده: 16, هفده: 17, هجده: 18, نوزده: 19, بیست: 20, سی: 30, چهل: 40,
+	پنجاه: 50, شصت: 60, هفتاد: 70, هشتاد: 80, نود: 90, صد: 100, دویست: 200, سیصد: 300,
+	چهارصد: 400, پانصد: 500,
+};
+
+const UNSUPPORTED_DURATION_UNITS = /ثانیه|روز|هفته|ماه|سال/;
+
+function durationTokenValue(token: string): number | null {
+	if (/^\d+$/.test(token)) return Number(token);
+	const word = PERSIAN_NUMBER_WORDS[token];
+	return word === undefined ? null : word;
+}
+
+function parseNumberTokens(tokens: string[]): number | null {
+	if (tokens.length === 0) return null;
+	let sum = 0;
+	let expectNumber = true;
+	for (const token of tokens) {
+		if (token === "و") {
+			if (expectNumber) return null; // dangling separator
+			expectNumber = true;
+			continue;
+		}
+		const value = durationTokenValue(token);
+		if (value === null || !expectNumber) return null; // not a number, or two numbers without separator
+		sum += value; // additive: "بیست و پنج" = 25, "صد و بیست" = 120
+		expectNumber = false;
+	}
+	return expectNumber ? null : sum;
+}
+
+// Deterministic Persian duration parser (minutes): scans the ORIGINAL user message for
+// explicit «X دقیقه» / «Y ساعت» groups — Persian number words, compound words
+// ("بیست و پنج"), and Persian/Arabic/English digits. Combined durations sum
+// ("یک ساعت و ۱۵ دقیقه" = 75). Never infers a unit: a missing, ambiguous,
+// duplicated, or unsupported duration returns null and the Worker asks instead.
+export function parsePersianDuration(text: string): number | null {
+	const normalized = toAsciiDigits(normalizePersian(text));
+	if (UNSUPPORTED_DURATION_UNITS.test(normalized)) return null;
+	const perUnit: { دقیقه: number[]; ساعت: number[] } = { دقیقه: [], ساعت: [] };
+	const unitRegex = /(دقیقه|ساعت)/g;
+	let match: RegExpExecArray | null;
+	while ((match = unitRegex.exec(normalized)) !== null) {
+		const unit = match[1] as "دقیقه" | "ساعت";
+		const tokens = normalized.slice(0, match.index).trim().split(/\s+/).reverse();
+		const collected: string[] = [];
+		for (const token of tokens) {
+			if (token === "و" || durationTokenValue(token) !== null) {
+				collected.unshift(token);
+				if (collected.length > 6) break;
+				continue;
+			}
+			break;
+		}
+		while (collected.length > 0 && collected[0] === "و") collected.shift();
+		while (collected.length > 0 && collected[collected.length - 1] === "و") collected.pop();
+		const value = parseNumberTokens(collected);
+		if (value === null) return null; // unit present but no parseable quantity
+		perUnit[unit].push(value);
+	}
+	const minutes = perUnit.دقیقه[0] ?? 0;
+	const hours = perUnit.ساعت[0] ?? 0;
+	if (perUnit.دقیقه.length > 1 || perUnit.ساعت.length > 1) return null; // duplicated unit -> ambiguous
+	if (perUnit.دقیقه.length + perUnit.ساعت.length === 0) return null; // no explicit duration
+	return hours * 60 + minutes;
+}
+
 function formatDelayLabel(delay: number): string {
 	const hours = Math.floor(delay / 60);
 	const minutes = delay % 60;
@@ -889,11 +959,20 @@ function formatDelayLabel(delay: number): string {
 	return `${hours} ساعت و ${minutes} دقیقه`;
 }
 
-export async function executeReminder(env: Env, userId: string, parsed: LLMAction, nowMs: number = Date.now()): Promise<string> {
+export async function executeReminder(
+	env: Env,
+	userId: string,
+	parsed: LLMAction,
+	userText: string,
+	nowMs: number = Date.now()
+): Promise<string> {
 	const text = parsed.reminder_text?.trim() ?? "";
 	if (text.length === 0) return "لطفاً بگو چه چیزی را برایت یادآوری کنم.";
 	if (text.length > MAX_REMINDER_TEXT_LENGTH) return "متن یادآوری خیلی طولانی است.";
-	const delay = parsed.delay_minutes;
+	// The delay is parsed deterministically from the user's own words — the model's
+	// delay_minutes is never trusted. Missing/ambiguous/unsupported durations fail
+	// safely without inserting anything.
+	const delay = parsePersianDuration(userText);
 	if (delay === null || !Number.isInteger(delay) || delay < 1 || delay > MAX_REMINDER_DELAY_MINUTES) {
 		return "فاصله زمانی یادآوری معتبر نیست. لطفاً مدت را دقیق بگو، مثلاً «پنج دقیقه دیگه» یا «دو ساعت دیگه».";
 	}

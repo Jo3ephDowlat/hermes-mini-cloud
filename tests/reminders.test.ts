@@ -3,7 +3,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { deliverDueReminders, executeReminder, parseLLMAction } from "../src/index.ts";
+import { deliverDueReminders, executeReminder, parseLLMAction, parsePersianDuration } from "../src/index.ts";
 
 const NOW_MS = 1_700_000_000_000;
 const NOW = Math.floor(NOW_MS / 1000);
@@ -240,11 +240,47 @@ test("unknown actions are still rejected by the parser", () => {
 	assert.equal(parseLLMAction(reminderIntent({ action: "alarm" })), null);
 });
 
+// ---------- deterministic duration parsing ----------
+
+test("production bug: «دو دقیقه دیگه بگو تست دوم» parses as 2 minutes", () => {
+	assert.equal(parsePersianDuration("دو دقیقه دیگه بگو تست دوم"), 2);
+});
+
+test("hours, combined durations, and digit systems parse explicitly", () => {
+	assert.equal(parsePersianDuration("دو ساعت دیگه یادآوری کن"), 120);
+	assert.equal(parsePersianDuration("یک ساعت و ۱۵ دقیقه دیگه"), 75);
+	assert.equal(parsePersianDuration("۱۵ دقیقه دیگه"), 15);
+	assert.equal(parsePersianDuration("15 دقیقه دیگه"), 15);
+	assert.equal(parsePersianDuration("1 ساعت و 30 دقیقه دیگه"), 90);
+	assert.equal(parsePersianDuration("بیست و پنج دقیقه دیگه"), 25);
+});
+
+test("missing, duplicated or unsupported durations return null", () => {
+	assert.equal(parsePersianDuration("فردا یادآوری کن"), null);
+	assert.equal(parsePersianDuration("سه دقیقه و پنج دقیقه دیگه"), null);
+	assert.equal(parsePersianDuration("یک هفته دیگه"), null);
+	assert.equal(parsePersianDuration("نیم ساعت دیگه"), null);
+});
+
+test("worker ignores the LLM delay and uses the parsed user duration", async () => {
+	const state = baseState();
+	const reply = await executeReminder(
+		{ DB: makeD1(state) } as never,
+		USER,
+		reminderIntent({ delay_minutes: 120 }) as never, // model wrongly said 2 hours
+		"دو دقیقه دیگه بگو تست دوم",
+		NOW_MS
+	);
+	assert.equal(state.reminders.length, 1);
+	assert.equal(state.reminders[0].due_at, NOW + 120); // 2 minutes, not 120
+	assert.match(reply, /2 دقیقه/);
+});
+
 // ---------- creation & strict validation ----------
 
 test("valid reminder is persisted with UTC unix due timestamp and Persian confirmation", async () => {
 	const state = baseState();
-	const reply = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent() as never, NOW_MS);
+	const reply = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent() as never, "ده دقیقه دیگه به مامان زنگ بزن", NOW_MS);
 	assert.equal(state.reminders.length, 1);
 	const row = state.reminders[0];
 	assert.equal(row.telegram_user_id, USER);
@@ -259,30 +295,30 @@ test("valid reminder is persisted with UTC unix due timestamp and Persian confir
 
 test("hourly delays are converted to minutes (two hours = 120)", async () => {
 	const state = baseState();
-	const reply = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent({ delay_minutes: 120 }) as never, NOW_MS);
+	const reply = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent({ delay_minutes: 120 }) as never, "دو ساعت دیگه جلسه دارم", NOW_MS);
 	assert.equal(state.reminders[0].due_at, NOW + 7200);
 	assert.match(reply, /2 ساعت/);
 });
 
 test("delay label keeps exact hours and minutes (90 minutes = 1 ساعت و 30 دقیقه)", async () => {
 	const state = baseState();
-	const reply = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent({ delay_minutes: 90 }) as never, NOW_MS);
+	const reply = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent({ delay_minutes: 90 }) as never, "یک ساعت و سی دقیقه دیگه", NOW_MS);
 	assert.equal(state.reminders[0].due_at, NOW + 5400);
 	assert.match(reply, /1 ساعت و 30 دقیقه/);
 });
 
-test("invalid delays are rejected without creating a reminder", async () => {
-	for (const delay_minutes of [0, -5, 1.5, 43_201, null]) {
+test("ambiguous durations are rejected without creating a reminder", async () => {
+	for (const userText of ["فردا یادآوری کن", "یک هفته دیگه", "سه دقیقه و پنج دقیقه دیگه", "نیم ساعت دیگه"]) {
 		const state = baseState();
-		const reply = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent({ delay_minutes }) as never, NOW_MS);
-		assert.equal(state.reminders.length, 0, `delay ${delay_minutes} must not create a row`);
+		const reply = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent() as never, userText, NOW_MS);
+		assert.equal(state.reminders.length, 0, `"${userText}" must not create a row`);
 		assert.match(reply, /معتبر نیست/);
 	}
 });
 
 test("invalid reminder text is rejected without creating a reminder", async () => {
 	const state = baseState();
-	const blank = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent({ reminder_text: "   " }) as never, NOW_MS);
+	const blank = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent({ reminder_text: "   " }) as never, "پنج دقیقه دیگه", NOW_MS);
 	assert.equal(state.reminders.length, 0);
 	assert.match(blank, /چه چیزی/);
 
@@ -291,6 +327,7 @@ test("invalid reminder text is rejected without creating a reminder", async () =
 		{ DB: makeD1(state2) } as never,
 		USER,
 		reminderIntent({ reminder_text: "x".repeat(501) }) as never,
+		"پنج دقیقه دیگه",
 		NOW_MS
 	);
 	assert.equal(state2.reminders.length, 0);
