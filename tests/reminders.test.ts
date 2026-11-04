@@ -88,13 +88,20 @@ function makeD1(state: FakeState): unknown {
 						});
 						return { meta: { changes: 1 } };
 					}
-					// stale-claim recovery (whole-table sweep)
-					if (sql.startsWith("UPDATE reminders SET status = 'pending', claimed_at = NULL WHERE status = 'claimed' AND claimed_at")) {
-						const cutoff = stmt.p[0] as number;
+					// stale-claim recovery: counts as a failed attempt (bounded at 5)
+					if (sql.startsWith("UPDATE reminders") && sql.includes("attempt_count = attempt_count + 1")) {
+						const [now, cutoff] = stmt.p as [number, number];
 						let n = 0;
 						for (const r of state.reminders) {
 							if (r.status === "claimed" && r.claimed_at !== null && r.claimed_at < cutoff) {
-								r.status = "pending";
+								r.attempt_count += 1;
+								if (r.attempt_count >= 5) {
+									r.status = "failed";
+									r.next_attempt_at = null;
+								} else {
+									r.status = "pending";
+									r.next_attempt_at = now + 60 * r.attempt_count;
+								}
 								r.claimed_at = null;
 								n++;
 							}
@@ -377,13 +384,37 @@ test("fresh claims within the 16-minute threshold are left alone (Cron may run 1
 	assert.equal(state.reminders[0].status, "claimed");
 });
 
-test("stale claims older than 16 minutes are recovered and delivered", async (t) => {
+test("stale claims older than 16 minutes are recovered (counted as an attempt) and delivered after backoff", async (t) => {
 	const state = baseState();
 	seed(state, { message: "گمشده", due_at: NOW - 1000, status: "claimed", claimed_at: NOW - 961 });
 	mockTelegram(t, state);
-	const stats = await deliverDueReminders({ DB: makeD1(state), TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS);
-	assert.equal(stats.sent, 1);
+	const d1 = makeD1(state);
+	const stats = await deliverDueReminders({ DB: d1, TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS);
+	assert.equal(stats.sent, 0); // backoff defers the retried delivery
+	assert.equal(state.reminders[0].status, "pending");
+	assert.equal(state.reminders[0].attempt_count, 1);
+	assert.equal(state.reminders[0].next_attempt_at, NOW + 60);
+	const stats2 = await deliverDueReminders({ DB: d1, TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS + 60_000);
+	assert.equal(stats2.sent, 1);
 	assert.equal(state.reminders[0].status, "sent");
+});
+
+test("repeated crashes cannot cause unlimited retries: recovery caps at 5 attempts", async (t) => {
+	const state = baseState();
+	seed(state, { message: "تصادفی", due_at: NOW + 100_000 }); // not due — scan never sends; pure crash-recovery cycles
+	mockTelegram(t, state);
+	const d1 = makeD1(state);
+	for (let i = 0; i < 5; i++) {
+		const tMs = NOW_MS + i * 200_000;
+		// the previous invocation died mid-delivery, leaving a stale claim:
+		state.reminders[0].status = "claimed";
+		state.reminders[0].claimed_at = Math.floor(tMs / 1000) - 1000;
+		const stats = await deliverDueReminders({ DB: d1, TELEGRAM_BOT_TOKEN: "test-token" } as never, tMs);
+		assert.equal(stats.sent, 0);
+	}
+	assert.equal(state.reminders[0].status, "failed");
+	assert.equal(state.reminders[0].attempt_count, 5);
+	assert.equal(state.telegramCalls.length, 0); // a crashed loop never sent anything
 });
 
 test("reminders of unauthorized users are cancelled without any Telegram call", async (t) => {

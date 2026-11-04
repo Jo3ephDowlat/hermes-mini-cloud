@@ -920,9 +920,18 @@ export async function deliverDueReminders(
 	// Recover reminders left in 'claimed' by a dead invocation: a Cloudflare Cron
 	// invocation may legally run up to 15 minutes, so only claims older than 16
 	// minutes are certainly abandoned. The claim itself stays atomic (CAS below).
+	// A recovery counts as a failed attempt and shares the same backoff and
+	// 5-attempt cap as delivery failures, so repeated crashes cannot retry forever.
 	await env.DB
-		.prepare("UPDATE reminders SET status = 'pending', claimed_at = NULL WHERE status = 'claimed' AND claimed_at IS NOT NULL AND claimed_at < ?1")
-		.bind(now - REMINDER_STALE_CLAIM_SECONDS)
+		.prepare(
+			`UPDATE reminders
+			   SET status = CASE WHEN attempt_count + 1 >= ${REMINDER_MAX_ATTEMPTS} THEN 'failed' ELSE 'pending' END,
+			       attempt_count = attempt_count + 1,
+			       claimed_at = NULL,
+			       next_attempt_at = CASE WHEN attempt_count + 1 >= ${REMINDER_MAX_ATTEMPTS} THEN NULL ELSE ?1 + ${REMINDER_RETRY_BACKOFF_SECONDS} * (attempt_count + 1) END
+			 WHERE status = 'claimed' AND claimed_at IS NOT NULL AND claimed_at < ?2`
+		)
+		.bind(now, now - REMINDER_STALE_CLAIM_SECONDS)
 		.run();
 
 	const { results } = await env.DB
