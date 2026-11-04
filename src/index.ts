@@ -16,10 +16,14 @@ const CLARIFICATION_TTL_MINUTES = 10;
 const LLM_TIMEOUT_MS = 25_000;
 const MAX_MESSAGE_LENGTH = 4000;
 const MAX_TASK_TITLE_LENGTH = 500;
+const MAX_REMINDER_TEXT_LENGTH = 500;
+const MAX_REMINDER_DELAY_MINUTES = 43_200; // 30 days
+const REMINDER_BATCH_SIZE = 20;
+const REMINDER_STALE_CLAIM_SECONDS = 300;
 
 const FALLBACK_REPLY = "متأسفم، متوجه درخواست شما نشدم. لطفاً دوباره تلاش کنید.";
 
-const ACTIONS = ["add", "done", "undone", "del", "list", "chat"] as const;
+const ACTIONS = ["add", "done", "undone", "del", "list", "chat", "remind"] as const;
 type Action = (typeof ACTIONS)[number];
 
 type ClarificationAction = "done" | "undone" | "del";
@@ -44,6 +48,8 @@ interface LLMAction {
 	due_date: string | null;
 	delete_all: boolean;
 	include_completed: boolean;
+	reminder_text: string | null;
+	delay_minutes: number | null;
 	needs_clarification: boolean;
 	clarification_question: string | null;
 	reply: string | null;
@@ -271,7 +277,7 @@ You convert the user's Persian message into exactly ONE action, expressed as str
 
 Output rules:
 - Respond with ONLY a single JSON object. No markdown, no code fences, no extra text.
-- Allowed "action" values: add, done, undone, del, list, chat.
+- Allowed "action" values: add, done, undone, del, list, chat, remind.
 - Use "chat" for greetings, questions, and anything that is not a task operation.
 - "reply": your natural Persian reply shown to the user. Required for "chat"; for other actions write a short Persian confirmation sentence too.
 - "title": new task title. Required for "add", null otherwise.
@@ -279,6 +285,7 @@ Output rules:
 - "due_date": Gregorian ISO date "YYYY-MM-DD" for "add" when the user mentions a date, else null. Resolve relative dates like "فردا" or "پس‌فردا" using the current date below.
 - "delete_all": true ONLY when the user clearly asks to delete ALL of their tasks.
 - "include_completed": true when the user asks the "list" to show completed tasks.
+- Use "remind" ONLY when the user asks to be reminded about something with a RELATIVE delay like "X دقیقه دیگه" or "X ساعت دیگه". "reminder_text" is what to remind about WITHOUT the time words. "delay_minutes" is the integer delay in minutes from now (hours × 60), computed against the current Tehran time below. Supported range: 1 to 43200 minutes (30 days). For absolute dates/times or unclear timing do NOT use "remind" — use "chat" and politely ask for a relative delay.
 - "needs_clarification": true when the request is ambiguous (e.g. a title matches several candidates, or a referenced list number does not exist). Then set "clarification_question" to one short Persian question and do not guess.
 - Candidates come in two sections: "Pending tasks" and "Completed tasks". Positions are 1-based and continuous: pending tasks have positions 1..n (n = count of pending tasks) and completed tasks have positions n+1..n+m (m = count of completed tasks). These positions match the numbered list shown to the user.
 - A position number ("شماره ۳") for a PENDING task always resolves within the pending section.
@@ -322,7 +329,7 @@ function extractJson(text: string): unknown {
 	return null;
 }
 
-function parseLLMAction(raw: unknown): LLMAction | null {
+export function parseLLMAction(raw: unknown): LLMAction | null {
 	if (typeof raw !== "object" || raw === null) return null;
 	const o = raw as Record<string, unknown>;
 	if (typeof o.action !== "string" || !(ACTIONS as readonly string[]).includes(o.action)) return null;
@@ -336,6 +343,8 @@ function parseLLMAction(raw: unknown): LLMAction | null {
 		due_date: str(o.due_date),
 		delete_all: bool(o.delete_all),
 		include_completed: bool(o.include_completed),
+		reminder_text: str(o.reminder_text),
+		delay_minutes: num(o.delay_minutes),
 		needs_clarification: bool(o.needs_clarification),
 		clarification_question: str(o.clarification_question),
 		reply: str(o.reply),
@@ -774,6 +783,8 @@ export async function handleUserMessage(env: Env, userId: string, text: string, 
 			return executeList(env, userId, parsed.include_completed);
 		case "chat":
 			return parsed.reply ?? FALLBACK_REPLY;
+		case "remind":
+			return executeReminder(env, userId, parsed);
 	}
 }
 
@@ -794,7 +805,7 @@ async function processMessage(env: Env, userId: string, chatId: number, text: st
 	await sendTelegramMessage(env.TELEGRAM_BOT_TOKEN, chatId, reply);
 }
 
-async function sendTelegramMessage(token: string, chatId: number, text: string): Promise<void> {
+async function sendTelegramMessageResult(token: string, chatId: number, text: string): Promise<boolean> {
 	try {
 		const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
 			method: "POST",
@@ -802,9 +813,15 @@ async function sendTelegramMessage(token: string, chatId: number, text: string):
 			body: JSON.stringify({ chat_id: chatId, text }),
 		});
 		if (!res.ok) console.error(`Telegram sendMessage failed with HTTP ${res.status}`);
+		return res.ok;
 	} catch (error) {
 		logError("Telegram sendMessage error", error);
+		return false;
 	}
+}
+
+async function sendTelegramMessage(token: string, chatId: number, text: string): Promise<void> {
+	await sendTelegramMessageResult(token, chatId, text);
 }
 
 // ---------- Telegram webhook (Phase A + H) ----------
@@ -860,6 +877,92 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 	return jsonResponse({ ok: true });
 }
 
+// ---------- Natural-language reminders (v2, phase 1) ----------
+
+export async function executeReminder(env: Env, userId: string, parsed: LLMAction, nowMs: number = Date.now()): Promise<string> {
+	const text = parsed.reminder_text?.trim() ?? "";
+	if (text.length === 0) return "لطفاً بگو چه چیزی را برایت یادآوری کنم.";
+	if (text.length > MAX_REMINDER_TEXT_LENGTH) return "متن یادآوری خیلی طولانی است.";
+	const delay = parsed.delay_minutes;
+	if (delay === null || !Number.isInteger(delay) || delay < 1 || delay > MAX_REMINDER_DELAY_MINUTES) {
+		return "فاصله زمانی یادآوری معتبر نیست. لطفاً مدت را دقیق بگو، مثلاً «پنج دقیقه دیگه» یا «دو ساعت دیگه».";
+	}
+	// The due moment is computed in Worker code from the validated relative delay —
+	// never inside the LLM. Stored as UTC Unix seconds.
+	const now = Math.floor(nowMs / 1000);
+	const dueAt = now + delay * 60;
+	await env.DB
+		.prepare("INSERT INTO reminders (telegram_user_id, message, due_at, status, created_at) VALUES (?1, ?2, ?3, 'pending', ?4)")
+		.bind(userId, text, dueAt, now)
+		.run();
+	const clock = new Intl.DateTimeFormat("fa-IR", { timeZone: "Asia/Tehran", hour: "2-digit", minute: "2-digit" }).format(
+		new Date(dueAt * 1000)
+	);
+	const delayLabel = delay < 60 ? `${delay} دقیقه` : `${Math.round(delay / 60)} ساعت`;
+	return `⏰ باشه، ${delayLabel} دیگه یادت می‌اندازم: «${text}» (حدود ساعت ${clock}).`;
+}
+
+export async function deliverDueReminders(
+	env: Env,
+	nowMs: number = Date.now()
+): Promise<{ sent: number; failed: number; skipped: number }> {
+	const now = Math.floor(nowMs / 1000);
+	// Recover reminders left in 'claimed' by a dead invocation (the cron runs every
+	// minute, so anything claimed minutes ago is stale and safe to requeue).
+	await env.DB
+		.prepare("UPDATE reminders SET status = 'pending', claimed_at = NULL WHERE status = 'claimed' AND claimed_at IS NOT NULL AND claimed_at < ?1")
+		.bind(now - REMINDER_STALE_CLAIM_SECONDS)
+		.run();
+
+	const { results } = await env.DB
+		.prepare("SELECT id, telegram_user_id, message FROM reminders WHERE status = 'pending' AND due_at <= ?1 ORDER BY due_at ASC LIMIT ?2")
+		.bind(now, REMINDER_BATCH_SIZE)
+		.all<{ id: number; telegram_user_id: string; message: string }>();
+
+	let sent = 0;
+	let failed = 0;
+	let skipped = 0;
+	for (const reminder of results ?? []) {
+		// Atomic compare-and-set claim: a concurrent run can never win the same row,
+		// so a reminder is delivered at most once per successful send.
+		const claim = await env.DB
+			.prepare("UPDATE reminders SET status = 'claimed', claimed_at = ?1 WHERE id = ?2 AND status = 'pending'")
+			.bind(now, reminder.id)
+			.run();
+		if (!claim.meta.changes) {
+			skipped++;
+			continue;
+		}
+		// Reminders may only be delivered to currently authorized users; a revoked
+		// user's reminders are cancelled without ever being sent.
+		if (!(await isUserAuthorized(env.DB, reminder.telegram_user_id))) {
+			await env.DB.prepare("UPDATE reminders SET status = 'cancelled' WHERE id = ?1 AND status = 'claimed'").bind(reminder.id).run();
+			skipped++;
+			continue;
+		}
+		const delivered = await sendTelegramMessageResult(
+			env.TELEGRAM_BOT_TOKEN,
+			Number(reminder.telegram_user_id),
+			`⏰ یادآوری: ${reminder.message}`
+		);
+		if (delivered) {
+			await env.DB
+				.prepare("UPDATE reminders SET status = 'sent', sent_at = ?1 WHERE id = ?2 AND status = 'claimed'")
+				.bind(now, reminder.id)
+				.run();
+			sent++;
+		} else {
+			// Release the claim so the next cron run retries the delivery.
+			await env.DB
+				.prepare("UPDATE reminders SET status = 'pending', claimed_at = NULL WHERE id = ?1 AND status = 'claimed'")
+				.bind(reminder.id)
+				.run();
+			failed++;
+		}
+	}
+	return { sent, failed, skipped };
+}
+
 // ---------- Worker entry point ----------
 
 export default {
@@ -903,5 +1006,8 @@ export default {
 			default:
 				return jsonResponse({ error: "Not found", path: pathname }, 404);
 		}
+	},
+	async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+		await deliverDueReminders(env);
 	},
 };

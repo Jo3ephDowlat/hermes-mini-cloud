@@ -17,6 +17,7 @@ running entirely on [Cloudflare Workers](https://developers.cloudflare.com/worke
 - [x] LLM intelligence (OpenAI-compatible Chat Completions, strict JSON contract)
 - [x] Conversation memory (per-user, persisted in D1)
 - [x] Destructive-action confirmation flow (delete-all)
+- [x] Natural-language reminders (v2, phase 1) — relative delays only; on this branch, not deployed
 - [ ] Persian UI polish & extra commands (future work)
 
 ## Architecture
@@ -152,6 +153,25 @@ pending clarification survives and Telegram's redelivery re-resolves the same ch
 duplicate mutation. If the selected task no longer exists (or is no longer owned by the user), the
 pending state is cleared safely and nothing is executed.
 
+## Natural-Language Reminders (v2 — phase 1)
+
+Persian relative-time reminders («ده دقیقه دیگه یادآوری کن آب بخورم») are created through a new
+`remind` LLM action:
+
+- The model returns `reminder_text` and `delay_minutes` (relative minutes/hours only). The Worker
+  validates both strictly (non-empty text ≤ 500 chars; integer delay 1–43200 minutes) and computes
+  the due moment itself as a **UTC Unix timestamp** — never inside the LLM. Invalid or ambiguous
+  requests fail safely with a Persian message and no database write.
+- Reminders are stored in the D1 `reminders` table with status `pending`; the bot confirms in
+  Persian with the reminder text and the approximate Tehran delivery time.
+- A Cloudflare Cron Trigger (`* * * * *`) runs the Worker's `scheduled()` handler: it requeues
+  claims left stale by dead runs (older than 5 minutes), selects up to 20 due reminders, atomically
+  claims each row (compare-and-set `UPDATE … WHERE status = 'pending'`), verifies the owner is
+  still on the `authorized_users` whitelist, and sends «⏰ یادآوری: …» via the Telegram Bot API.
+- Status becomes `sent` (with `sent_at`) only after a successful Telegram API response; failures
+  release the claim back to `pending` for the next run. Concurrent runs can never double-deliver,
+  and there is no public HTTP endpoint that can trigger delivery.
+
 ## Conversation Memory
 
 - Both user and assistant messages are stored in `conversation_messages`.
@@ -229,6 +249,8 @@ to the caller's ID with a **bound parameter** — never string interpolation:
 - **`pending_confirmations`** — one pending delete-all per user with expiry (`0002`).
 - **`pending_clarifications`** — one stored clarification (action + candidate snapshot) per user
   with expiry, for ambiguous `done`/`undone`/`del` (`0003_pending_clarifications.sql`).
+- **`reminders`** — persistent reminders with UTC Unix due timestamps and claim-based delivery
+  (`0004_reminders.sql`).
 
 ### Migration Workflow
 
