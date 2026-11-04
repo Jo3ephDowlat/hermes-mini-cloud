@@ -128,6 +128,30 @@ candidate list (real task ids) and the conversation history. Ambiguous reference
 `task_id` is re-verified against `telegram_user_id` in SQL before any update or delete, so one user
 can never affect another user's tasks.
 
+**Deterministic mutation guard (v1.1).** For `done`/`undone`/`del` the model's `task_id` is never
+trusted on its own: the user's own message must deterministically identify the task — a unique
+title match, or a position from a numbered list that was actually displayed to that user in recent
+conversation history (pending-list and completed-section markers are detected in stored history).
+Vague phrases like «اون تسک دانشگاهی» never mutate anything; they open a stored clarification
+instead.
+
+**Stored clarifications (v1.1).** When `done`/`undone`/`del` is ambiguous, the requested action and
+a numbered snapshot of the user's own tasks are saved in `pending_clarifications` (10-minute
+expiry, one row per user). The next message is resolved **deterministically in code** against that
+snapshot — it never reaches the LLM as a new instruction: an explicit title is matched only against
+the snapshot (a title that does not exist never falls back to a position or another task); several
+matches re-ask with the matching subset; a position is accepted only if that exact numbered list
+was displayed in the bot's clarification message; cancellation («انصراف») clears the state without
+executing. Before executing, the selected task is re-verified to still exist and belong to the same
+user. A clarification reply can never switch the stored action.
+
+**Clarification retry safety (v1.1).** The task mutation and the pending-state cleanup run in one
+D1 `batch` (a single transaction): if the mutation fails, the cleanup rolls back with it, so the
+pending clarification survives and Telegram's redelivery re-resolves the same choice. `done` /
+`undone` are idempotent and a retried `del` matches zero rows, so a retry can never apply a
+duplicate mutation. If the selected task no longer exists (or is no longer owned by the user), the
+pending state is cleared safely and nothing is executed.
+
 ## Conversation Memory
 
 - Both user and assistant messages are stored in `conversation_messages`.
@@ -203,6 +227,8 @@ to the caller's ID with a **bound parameter** — never string interpolation:
 - **`authorized_users`** — restricted whitelist of Telegram users (`0002_telegram_runtime.sql`).
 - **`processed_updates`** — Telegram `update_id` deduplication (`0002_telegram_runtime.sql`).
 - **`pending_confirmations`** — one pending delete-all per user with expiry (`0002`).
+- **`pending_clarifications`** — one stored clarification (action + candidate snapshot) per user
+  with expiry, for ambiguous `done`/`undone`/`del` (`0003_pending_clarifications.sql`).
 
 ### Migration Workflow
 

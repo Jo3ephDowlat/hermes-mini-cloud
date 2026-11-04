@@ -12,6 +12,7 @@ const JSON_HEADERS = { "Content-Type": "application/json; charset=utf-8" };
 const HISTORY_CONTEXT_MESSAGES = 12;
 const HISTORY_STORE_LIMIT = 30;
 const CONFIRMATION_TTL_MINUTES = 10;
+const CLARIFICATION_TTL_MINUTES = 10;
 const LLM_TIMEOUT_MS = 25_000;
 const MAX_MESSAGE_LENGTH = 4000;
 const MAX_TASK_TITLE_LENGTH = 500;
@@ -20,6 +21,21 @@ const FALLBACK_REPLY = "متأسفم، متوجه درخواست شما نشدم
 
 const ACTIONS = ["add", "done", "undone", "del", "list", "chat"] as const;
 type Action = (typeof ACTIONS)[number];
+
+type ClarificationAction = "done" | "undone" | "del";
+
+interface ClarificationCandidate {
+	id: number;
+	position: number;
+	title: string;
+}
+
+type ClarificationDecision =
+	| { kind: "resolved"; task_id: number; title: string }
+	| { kind: "ambiguous"; matches: ClarificationCandidate[] }
+	| { kind: "not_found" }
+	| { kind: "position_invalid"; position: number }
+	| { kind: "unclear" };
 
 interface LLMAction {
 	action: Action;
@@ -141,7 +157,7 @@ function isAffirmative(text: string): boolean {
 	return AFFIRMATIVE_WORDS.includes(normalizePersian(text));
 }
 
-function isCancellation(text: string): boolean {
+export function isCancellation(text: string): boolean {
 	return CANCELLATION_WORDS.includes(normalizePersian(text));
 }
 
@@ -228,11 +244,19 @@ function buildCandidateContext(tasks: UserTasks, completedListShown: boolean): s
 // assistant message proves the user was actually shown numbered completed tasks.
 const COMPLETED_SECTION_MARKER = "انجام‌شده‌ها";
 
+// executeList marks the pending section with this exact phrase; its presence in an
+// assistant message proves the user was actually shown the numbered pending list.
+const PENDING_LIST_MARKER = "📋 تسک‌های باز:";
+
 function historyShowsCompletedList(history: HistoryMessage[]): boolean {
 	return history.some((m) => m.role === "assistant" && m.content.includes(COMPLETED_SECTION_MARKER));
 }
 
-async function getOwnedTask(db: D1Database, userId: string, taskId: number): Promise<TaskRow | null> {
+function historyShowsPendingList(history: HistoryMessage[]): boolean {
+	return history.some((m) => m.role === "assistant" && m.content.includes(PENDING_LIST_MARKER));
+}
+
+export async function getOwnedTask(db: D1Database, userId: string, taskId: number): Promise<TaskRow | null> {
 	const row = await db
 		.prepare("SELECT id, title, is_done, due_date FROM tasks WHERE id = ?1 AND telegram_user_id = ?2")
 		.bind(taskId, userId)
@@ -365,35 +389,34 @@ async function executeAdd(env: Env, userId: string, parsed: LLMAction, updateId:
 	return due ? `✅ تسک «${parsed.title}» برای تاریخ ${due} ثبت شد.` : `✅ تسک «${parsed.title}» اضافه شد.`;
 }
 
-async function executeDone(env: Env, userId: string, parsed: LLMAction): Promise<string> {
-	if (!parsed.task_id) return "لطفاً مشخص کن کدام تسک را انجام‌شده کنم.";
-	const task = await getOwnedTask(env.DB, userId, parsed.task_id);
-	if (!task) return "چنین تسکی در فهرست شما پیدا نشد.";
-	await env.DB
-		.prepare("UPDATE tasks SET is_done = 1, completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND telegram_user_id = ?2")
-		.bind(parsed.task_id, userId)
-		.run();
-	return `✅ تسک «${task.title}» انجام شد. آفرین!`;
+// Single execution path for done/undone/del: always re-verifies ownership in SQL
+// immediately before mutating. Used by both the direct LLM flow and the
+// clarification resolution flow.
+function taskMutationStatement(db: D1Database, userId: string, action: ClarificationAction, taskId: number): D1PreparedStatement {
+	if (action === "done") {
+		return db
+			.prepare("UPDATE tasks SET is_done = 1, completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?1 AND telegram_user_id = ?2")
+			.bind(taskId, userId);
+	}
+	if (action === "undone") {
+		return db
+			.prepare("UPDATE tasks SET is_done = 0, completed_at = NULL, updated_at = datetime('now') WHERE id = ?1 AND telegram_user_id = ?2")
+			.bind(taskId, userId);
+	}
+	return db.prepare("DELETE FROM tasks WHERE id = ?1 AND telegram_user_id = ?2").bind(taskId, userId);
 }
 
-async function executeUndone(env: Env, userId: string, parsed: LLMAction): Promise<string> {
-	if (!parsed.task_id) return "لطفاً مشخص کن کدام تسک را برگردانم.";
-	const task = await getOwnedTask(env.DB, userId, parsed.task_id);
-	if (!task) return "چنین تسکی در فهرست شما پیدا نشد.";
-	await env.DB
-		.prepare("UPDATE tasks SET is_done = 0, completed_at = NULL, updated_at = datetime('now') WHERE id = ?1 AND telegram_user_id = ?2")
-		.bind(parsed.task_id, userId)
-		.run();
-	return `↩️ تسک «${task.title}» به حالت انجام‌نشده برگشت.`;
+function taskActionReply(action: ClarificationAction, title: string): string {
+	if (action === "done") return `✅ تسک «${title}» انجام شد. آفرین!`;
+	if (action === "undone") return `↩️ تسک «${title}» به حالت انجام‌نشده برگشت.`;
+	return `🗑 تسک «${title}» حذف شد.`;
 }
 
-async function executeDel(env: Env, userId: string, parsed: LLMAction): Promise<string> {
-	if (parsed.delete_all) return requestDeleteAll(env, userId);
-	if (!parsed.task_id) return "لطفاً مشخص کن کدام تسک را حذف کنم.";
-	const task = await getOwnedTask(env.DB, userId, parsed.task_id);
+async function executeTaskAction(env: Env, userId: string, action: ClarificationAction, taskId: number): Promise<string> {
+	const task = await getOwnedTask(env.DB, userId, taskId);
 	if (!task) return "چنین تسکی در فهرست شما پیدا نشد.";
-	await env.DB.prepare("DELETE FROM tasks WHERE id = ?1 AND telegram_user_id = ?2").bind(parsed.task_id, userId).run();
-	return `🗑 تسک «${task.title}» حذف شد.`;
+	await taskMutationStatement(env.DB, userId, action, taskId).run();
+	return taskActionReply(action, task.title);
 }
 
 async function executeList(env: Env, userId: string, includeCompleted: boolean): Promise<string> {
@@ -449,6 +472,211 @@ async function clearPendingConfirmation(db: D1Database, userId: string): Promise
 	await db.prepare("DELETE FROM pending_confirmations WHERE telegram_user_id = ?").bind(userId).run();
 }
 
+// ---------- Pending clarification for ambiguous task actions ----------
+// When done/undone/del is ambiguous, the requested action and a numbered snapshot of
+// the user's tasks are stored; the follow-up message is resolved deterministically
+// in code against that snapshot — it never reaches the LLM as a new instruction.
+
+const PERSIAN_ORDINALS: Record<string, number> = {
+	اول: 1,
+	دوم: 2,
+	سوم: 3,
+	چهارم: 4,
+	پنجم: 5,
+	ششم: 6,
+	هفتم: 7,
+	هشتم: 8,
+	نهم: 9,
+	دهم: 10,
+};
+
+const CLARIFICATION_FILLERS = [
+	"منظورم", "منظور", "همون", "همان", "همین", "تسک", "شماره", "گزینه", "لطفا",
+	"میخوام", "میخام", "باشه", "بله", "فقط", "رو", "از", "که", "به", "را", "بود",
+	"بشه", "کن", "این", "اون",
+];
+
+function toAsciiDigits(text: string): string {
+	return text
+		.replace(/[۰-۹]/g, (d) => String("۰۱۲۳۴۵۶۷۸۹".indexOf(d)))
+		.replace(/[٠-٩]/g, (d) => String("٠١٢٣٤٥٦٧٨٩".indexOf(d)));
+}
+
+// What remains of the reply after removing filler words, ordinals and digits —
+// i.e. potential title content. Non-empty core means the user named a task.
+function extractClarificationCore(normalizedText: string): string {
+	let s = ` ${normalizedText} `;
+	for (const word of CLARIFICATION_FILLERS) s = s.split(` ${word} `).join(" ");
+	s = s.replace(new RegExp(Object.keys(PERSIAN_ORDINALS).join("|"), "g"), " ");
+	s = s.replace(/\d+/g, " ");
+	return s.replace(/\s+/g, " ").trim();
+}
+
+function extractPosition(normalizedText: string): number | null {
+	const t = toAsciiDigits(normalizedText);
+	const numbers = Array.from(t.matchAll(/\d+/g), (m) => Number(m[0]));
+	const ordinals = Object.entries(PERSIAN_ORDINALS)
+		.filter(([word]) => t.includes(word))
+		.map(([, value]) => value);
+	const unique = [...new Set([...numbers, ...ordinals])];
+	return unique.length === 1 ? unique[0] : null;
+}
+
+export function resolveClarificationChoice(text: string, candidates: ClarificationCandidate[]): ClarificationDecision {
+	const normalizedText = normalizePersian(text);
+	const titleMatches = candidates.filter((c) => normalizedText.includes(normalizePersian(c.title)));
+	if (titleMatches.length === 1) return { kind: "resolved", task_id: titleMatches[0].id, title: titleMatches[0].title };
+	if (titleMatches.length > 1) return { kind: "ambiguous", matches: titleMatches };
+
+	// No stored title matched. Only when the reply carries no title-like content may a
+	// displayed position be used — a position is NEVER a fallback for a title that
+	// does not exist in the snapshot.
+	const core = extractClarificationCore(normalizedText);
+	if (core.length >= 3) {
+		const partial = candidates.filter((c) => normalizePersian(c.title).includes(core));
+		if (partial.length === 1) return { kind: "resolved", task_id: partial[0].id, title: partial[0].title };
+		if (partial.length > 1) return { kind: "ambiguous", matches: partial };
+		return { kind: "not_found" };
+	}
+
+	const position = extractPosition(normalizedText);
+	if (position !== null) {
+		const byPosition = candidates.find((c) => c.position === position);
+		if (!byPosition) return { kind: "position_invalid", position };
+		return { kind: "resolved", task_id: byPosition.id, title: byPosition.title };
+	}
+	return { kind: "unclear" };
+}
+
+function formatClarificationChoices(candidates: ClarificationCandidate[]): string {
+	return candidates.map((c) => `${c.position}. ${c.title}`).join("\n");
+}
+
+// Deterministic pre-mutation guard for done/undone/del: the model's task_id is
+// never trusted on its own. The user's own words must identify the task — a unique
+// title match (full or distinctive fragment), or a position from a numbered list
+// that was actually displayed to this user in recent history. Anything vague or
+// ambiguous is returned unresolved, which routes to a stored clarification.
+export function guardInitialTaskReference(
+	text: string,
+	tasks: UserTasks,
+	history: HistoryMessage[]
+): ClarificationDecision {
+	const candidates = [...tasks.pending, ...tasks.completed].map((t, i) => ({ id: t.id, position: i + 1, title: t.title }));
+	if (candidates.length === 0) return { kind: "not_found" };
+	const normalizedText = normalizePersian(text);
+
+	const titleMatches = candidates.filter((c) => normalizedText.includes(normalizePersian(c.title)));
+	if (titleMatches.length === 1) return { kind: "resolved", task_id: titleMatches[0].id, title: titleMatches[0].title };
+	if (titleMatches.length > 1) return { kind: "ambiguous", matches: titleMatches };
+
+	const position = extractPosition(normalizedText);
+	if (position !== null) {
+		// A position is only meaningful if that section's numbered list was actually
+		// shown to this user recently; otherwise the number was never displayed.
+		const sectionShown = position <= tasks.pending.length ? historyShowsPendingList(history) : historyShowsCompletedList(history);
+		if (!sectionShown) return { kind: "unclear" };
+		const byPosition = candidates.find((c) => c.position === position);
+		if (!byPosition) return { kind: "position_invalid", position };
+		return { kind: "resolved", task_id: byPosition.id, title: byPosition.title };
+	}
+
+	const core = extractClarificationCore(normalizedText);
+	if (core.length >= 3) {
+		const partial = candidates.filter((c) => normalizePersian(c.title).includes(core));
+		if (partial.length === 1) return { kind: "resolved", task_id: partial[0].id, title: partial[0].title };
+		if (partial.length > 1) return { kind: "ambiguous", matches: partial };
+		return { kind: "not_found" };
+	}
+	return { kind: "unclear" };
+}
+
+export async function clearPendingClarification(db: D1Database, userId: string): Promise<void> {
+	await db.prepare("DELETE FROM pending_clarifications WHERE telegram_user_id = ?").bind(userId).run();
+}
+
+async function requestClarification(env: Env, userId: string, action: ClarificationAction, tasks: UserTasks): Promise<string> {
+	const all = [...tasks.pending, ...tasks.completed];
+	if (all.length === 0) return "فعلاً تسکی برای این کار ندارید.";
+	const candidates: ClarificationCandidate[] = all.map((t, i) => ({ id: t.id, position: i + 1, title: t.title }));
+	await env.DB
+		.prepare(
+			`INSERT INTO pending_clarifications (telegram_user_id, action, candidates_json, expires_at)
+			 VALUES (?1, ?2, ?3, datetime('now', '+${CLARIFICATION_TTL_MINUTES} minutes'))
+			 ON CONFLICT(telegram_user_id) DO UPDATE SET
+			   action = excluded.action,
+			   candidates_json = excluded.candidates_json,
+			   created_at = excluded.created_at,
+			   expires_at = excluded.expires_at`
+		)
+		.bind(userId, action, JSON.stringify(candidates))
+		.run();
+	const labels: Record<ClarificationAction, string> = { done: "انجام‌شده کردن", undone: "برگرداندن به انجام‌نشده", del: "حذف" };
+	const lines = [
+		`کدام تسک را مد نظر دارید؟ (${labels[action]})`,
+		...candidates.map((c) => `${c.position}. ${c.title}`),
+		"",
+		"برای لغو بنویسید «انصراف».",
+	];
+	return lines.join("\n");
+}
+
+export async function resolvePendingClarification(
+	env: Env,
+	userId: string,
+	action: ClarificationAction,
+	candidatesJson: string,
+	text: string
+): Promise<string> {
+	let candidates: ClarificationCandidate[];
+	try {
+		const parsed = JSON.parse(candidatesJson) as ClarificationCandidate[];
+		if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("empty snapshot");
+		candidates = parsed;
+	} catch {
+		await clearPendingClarification(env.DB, userId);
+		return FALLBACK_REPLY;
+	}
+
+	const decision = resolveClarificationChoice(text, candidates);
+	switch (decision.kind) {
+		case "resolved":
+			return finishClarification(env, userId, action, decision.task_id);
+		case "ambiguous": {
+			const lines = ["چند تسک با این عنوان دارید؛ کدام را مد نظر دارید؟", ...decision.matches.map((c) => `${c.position}. ${c.title}`)];
+			return lines.join("\n");
+		}
+		case "not_found":
+			return `هیچ تسکی با این عنوان در گزینه‌های قبلی نبود. لطفاً شماره یا عنوان دقیق یکی از موارد زیر را بفرستید:\n${formatClarificationChoices(candidates)}`;
+		case "position_invalid":
+			return `شماره ${decision.position} در فهرست نیست. لطفاً یکی از شماره‌های زیر را بفرستید:\n${formatClarificationChoices(candidates)}`;
+		case "unclear":
+			return `متوجه نشدم. لطفاً شماره یا عنوان دقیق تسک را بفرستید، یا برای لغو بنویسید «انصراف».\n${formatClarificationChoices(candidates)}`;
+	}
+}
+
+async function finishClarification(env: Env, userId: string, action: ClarificationAction, taskId: number): Promise<string> {
+	// Re-verify against the live table: a task deleted (or never owned) since the
+	// clarification started can never be selected or executed on.
+	const task = await getOwnedTask(env.DB, userId, taskId);
+	if (!task) {
+		// Nothing to execute — clearing is the only write, so a failed clear simply
+		// means Telegram's redelivery re-asks and lands here again (idempotent).
+		await clearPendingClarification(env.DB, userId);
+		return "این تسک دیگر در فهرست شما وجود ندارد؛ عملیات اجرا نشد.";
+	}
+	// Mutation and pending-state cleanup run in ONE D1 batch (a single transaction):
+	// if either statement fails, both roll back, so the pending clarification
+	// survives and Telegram's redelivery re-resolves the same choice. done/undone
+	// are idempotent and a retried del matches zero rows, so no duplicate mutation
+	// can ever be applied.
+	await env.DB.batch([
+		taskMutationStatement(env.DB, userId, action, taskId),
+		env.DB.prepare("DELETE FROM pending_clarifications WHERE telegram_user_id = ?").bind(userId),
+	]);
+	return taskActionReply(action, task.title);
+}
+
 async function saveExchangeSafely(db: D1Database, userId: string, userText: string, reply: string): Promise<void> {
 	try {
 		await saveMessage(db, userId, "user", userText);
@@ -480,7 +708,7 @@ async function isUserAuthorized(db: D1Database, userId: string): Promise<boolean
 
 // ---------- Core message pipeline ----------
 
-async function handleUserMessage(env: Env, userId: string, text: string, updateId: number): Promise<string> {
+export async function handleUserMessage(env: Env, userId: string, text: string, updateId: number): Promise<string> {
 	// History is loaded BEFORE the current message is persisted: the current text is
 	// sent as the final user turn and nothing is written until an action actually
 	// executes, so a transient failure can be retried without duplicating history.
@@ -499,6 +727,21 @@ async function handleUserMessage(env: Env, userId: string, text: string, updateI
 		await clearPendingConfirmation(env.DB, userId);
 	}
 
+	// A pending clarification (ambiguous done/undone/del) must be answered next: the
+	// message is resolved deterministically against the stored snapshot and never
+	// reaches the LLM as a new instruction.
+	const clarification = await env.DB
+		.prepare("SELECT action, candidates_json FROM pending_clarifications WHERE telegram_user_id = ?1 AND expires_at > datetime('now')")
+		.bind(userId)
+		.first<{ action: ClarificationAction; candidates_json: string }>();
+	if (clarification) {
+		if (isCancellation(text)) {
+			await clearPendingClarification(env.DB, userId);
+			return "عملیات قبلی لغو شد.";
+		}
+		return resolvePendingClarification(env, userId, clarification.action, clarification.candidates_json, text);
+	}
+
 	const systemPrompt = buildSystemPrompt(tehranContext(), buildCandidateContext(tasks, completedListShown));
 
 	const raw = await callLLM(env, systemPrompt, [...history, { role: "user" as const, content: text }]);
@@ -506,6 +749,9 @@ async function handleUserMessage(env: Env, userId: string, text: string, updateI
 	if (!parsed) return FALLBACK_REPLY; // invalid JSON or action: no DB modification
 
 	if (parsed.needs_clarification) {
+		if (parsed.action === "done" || parsed.action === "undone" || (parsed.action === "del" && !parsed.delete_all)) {
+			return requestClarification(env, userId, parsed.action, tasks);
+		}
 		return parsed.clarification_question ?? "لطفاً بیشتر توضیح بده.";
 	}
 
@@ -513,11 +759,17 @@ async function handleUserMessage(env: Env, userId: string, text: string, updateI
 		case "add":
 			return executeAdd(env, userId, parsed, updateId);
 		case "done":
-			return executeDone(env, userId, parsed);
 		case "undone":
-			return executeUndone(env, userId, parsed);
-		case "del":
-			return executeDel(env, userId, parsed);
+		case "del": {
+			if (parsed.action === "del" && parsed.delete_all) return requestDeleteAll(env, userId);
+			// Deterministic guard: the model's task_id alone is never sufficient —
+			// the user's own words must identify the task (unique title, or a
+			// position from a numbered list actually shown to them). Anything vague
+			// or ambiguous becomes a stored clarification, never a mutation.
+			const guard = guardInitialTaskReference(text, tasks, history);
+			if (guard.kind !== "resolved") return requestClarification(env, userId, parsed.action, tasks);
+			return executeTaskAction(env, userId, parsed.action, guard.task_id);
+		}
 		case "list":
 			return executeList(env, userId, parsed.include_completed);
 		case "chat":
@@ -594,6 +846,7 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 	try {
 		// Cheap indexed housekeeping on each delivery.
 		await env.DB.prepare("DELETE FROM pending_confirmations WHERE expires_at <= datetime('now')").run();
+		await env.DB.prepare("DELETE FROM pending_clarifications WHERE expires_at <= datetime('now')").run();
 		await env.DB.prepare("DELETE FROM processed_updates WHERE processed_at <= datetime('now', '-7 days')").run();
 
 		await processMessage(env, userId, msg.chat.id, msg.text.trim().slice(0, MAX_MESSAGE_LENGTH), update.update_id);
