@@ -19,7 +19,9 @@ const MAX_TASK_TITLE_LENGTH = 500;
 const MAX_REMINDER_TEXT_LENGTH = 500;
 const MAX_REMINDER_DELAY_MINUTES = 43_200; // 30 days
 const REMINDER_BATCH_SIZE = 20;
-const REMINDER_STALE_CLAIM_SECONDS = 300;
+const REMINDER_STALE_CLAIM_SECONDS = 960; // 16 min — a Cron invocation may legally run up to 15 min
+const REMINDER_MAX_ATTEMPTS = 5;
+const REMINDER_RETRY_BACKOFF_SECONDS = 60; // multiplied by the attempt number (linear backoff)
 
 const FALLBACK_REPLY = "متأسفم، متوجه درخواست شما نشدم. لطفاً دوباره تلاش کنید.";
 
@@ -879,6 +881,14 @@ async function handleTelegramWebhook(request: Request, env: Env): Promise<Respon
 
 // ---------- Natural-language reminders (v2, phase 1) ----------
 
+function formatDelayLabel(delay: number): string {
+	const hours = Math.floor(delay / 60);
+	const minutes = delay % 60;
+	if (hours === 0) return `${delay} دقیقه`;
+	if (minutes === 0) return `${hours} ساعت`;
+	return `${hours} ساعت و ${minutes} دقیقه`;
+}
+
 export async function executeReminder(env: Env, userId: string, parsed: LLMAction, nowMs: number = Date.now()): Promise<string> {
 	const text = parsed.reminder_text?.trim() ?? "";
 	if (text.length === 0) return "لطفاً بگو چه چیزی را برایت یادآوری کنم.";
@@ -898,7 +908,7 @@ export async function executeReminder(env: Env, userId: string, parsed: LLMActio
 	const clock = new Intl.DateTimeFormat("fa-IR", { timeZone: "Asia/Tehran", hour: "2-digit", minute: "2-digit" }).format(
 		new Date(dueAt * 1000)
 	);
-	const delayLabel = delay < 60 ? `${delay} دقیقه` : `${Math.round(delay / 60)} ساعت`;
+	const delayLabel = formatDelayLabel(delay);
 	return `⏰ باشه، ${delayLabel} دیگه یادت می‌اندازم: «${text}» (حدود ساعت ${clock}).`;
 }
 
@@ -907,17 +917,20 @@ export async function deliverDueReminders(
 	nowMs: number = Date.now()
 ): Promise<{ sent: number; failed: number; skipped: number }> {
 	const now = Math.floor(nowMs / 1000);
-	// Recover reminders left in 'claimed' by a dead invocation (the cron runs every
-	// minute, so anything claimed minutes ago is stale and safe to requeue).
+	// Recover reminders left in 'claimed' by a dead invocation: a Cloudflare Cron
+	// invocation may legally run up to 15 minutes, so only claims older than 16
+	// minutes are certainly abandoned. The claim itself stays atomic (CAS below).
 	await env.DB
 		.prepare("UPDATE reminders SET status = 'pending', claimed_at = NULL WHERE status = 'claimed' AND claimed_at IS NOT NULL AND claimed_at < ?1")
 		.bind(now - REMINDER_STALE_CLAIM_SECONDS)
 		.run();
 
 	const { results } = await env.DB
-		.prepare("SELECT id, telegram_user_id, message FROM reminders WHERE status = 'pending' AND due_at <= ?1 ORDER BY due_at ASC LIMIT ?2")
+		.prepare(
+			"SELECT id, telegram_user_id, message, attempt_count FROM reminders WHERE status = 'pending' AND due_at <= ?1 AND (next_attempt_at IS NULL OR next_attempt_at <= ?1) ORDER BY due_at ASC LIMIT ?2"
+		)
 		.bind(now, REMINDER_BATCH_SIZE)
-		.all<{ id: number; telegram_user_id: string; message: string }>();
+		.all<{ id: number; telegram_user_id: string; message: string; attempt_count: number }>();
 
 	let sent = 0;
 	let failed = 0;
@@ -952,11 +965,22 @@ export async function deliverDueReminders(
 				.run();
 			sent++;
 		} else {
-			// Release the claim so the next cron run retries the delivery.
-			await env.DB
-				.prepare("UPDATE reminders SET status = 'pending', claimed_at = NULL WHERE id = ?1 AND status = 'claimed'")
-				.bind(reminder.id)
-				.run();
+			// Bounded retry with linear backoff: release the claim and schedule the
+			// next attempt (60 s × attempt number); after REMINDER_MAX_ATTEMPTS
+			// failures the reminder is marked 'failed' and never retried again.
+			const attempts = reminder.attempt_count + 1;
+			const nextAttemptAt = now + REMINDER_RETRY_BACKOFF_SECONDS * attempts;
+			if (attempts >= REMINDER_MAX_ATTEMPTS) {
+				await env.DB
+					.prepare("UPDATE reminders SET status = 'failed', attempt_count = ?1, claimed_at = NULL, next_attempt_at = NULL WHERE id = ?2 AND status = 'claimed'")
+					.bind(attempts, reminder.id)
+					.run();
+			} else {
+				await env.DB
+					.prepare("UPDATE reminders SET status = 'pending', attempt_count = ?1, claimed_at = NULL, next_attempt_at = ?2 WHERE id = ?3 AND status = 'claimed'")
+					.bind(attempts, nextAttemptAt, reminder.id)
+					.run();
+			}
 			failed++;
 		}
 	}

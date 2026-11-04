@@ -14,10 +14,12 @@ interface ReminderRow {
 	telegram_user_id: string;
 	message: string;
 	due_at: number;
-	status: "pending" | "claimed" | "sent" | "cancelled";
+	status: "pending" | "claimed" | "sent" | "cancelled" | "failed";
 	created_at: number;
 	claimed_at: number | null;
 	sent_at: number | null;
+	attempt_count: number;
+	next_attempt_at: number | null;
 }
 
 interface FakeState {
@@ -42,6 +44,8 @@ function seed(state: FakeState, row: Partial<ReminderRow>): ReminderRow {
 		created_at: NOW - 60,
 		claimed_at: null,
 		sent_at: null,
+		attempt_count: 0,
+		next_attempt_at: null,
 		...row,
 	};
 	state.reminders.push(full);
@@ -79,6 +83,8 @@ function makeD1(state: FakeState): unknown {
 							created_at,
 							claimed_at: null,
 							sent_at: null,
+							attempt_count: 0,
+							next_attempt_at: null,
 						});
 						return { meta: { changes: 1 } };
 					}
@@ -111,6 +117,26 @@ function makeD1(state: FakeState): unknown {
 						row.status = "cancelled";
 						return { meta: { changes: 1 } };
 					}
+					if (sql.startsWith("UPDATE reminders SET status = 'failed'")) {
+						const [attempts, id] = stmt.p as [number, number];
+						const row = state.reminders.find((r) => r.id === id && r.status === "claimed");
+						if (!row) return { meta: { changes: 0 } };
+						row.status = "failed";
+						row.attempt_count = attempts;
+						row.claimed_at = null;
+						row.next_attempt_at = null;
+						return { meta: { changes: 1 } };
+					}
+					if (sql.startsWith("UPDATE reminders SET status = 'pending', attempt_count")) {
+						const [attempts, next_attempt_at, id] = stmt.p as [number, number, number];
+						const row = state.reminders.find((r) => r.id === id && r.status === "claimed");
+						if (!row) return { meta: { changes: 0 } };
+						row.status = "pending";
+						row.attempt_count = attempts;
+						row.claimed_at = null;
+						row.next_attempt_at = next_attempt_at;
+						return { meta: { changes: 1 } };
+					}
 					if (sql.startsWith("UPDATE reminders SET status = 'sent'")) {
 						const [sent_at, id] = stmt.p as [number, number];
 						const row = state.reminders.find((r) => r.id === id && r.status === "claimed");
@@ -134,10 +160,20 @@ function makeD1(state: FakeState): unknown {
 					if (sql.includes("FROM reminders WHERE status = 'pending' AND due_at")) {
 						const [now, limit] = stmt.p as [number, number];
 						const rows = state.reminders
-							.filter((r) => r.status === "pending" && r.due_at <= now)
+							.filter(
+								(r) =>
+									r.status === "pending" &&
+									r.due_at <= now &&
+									(r.next_attempt_at === null || r.next_attempt_at <= now)
+							)
 							.sort((a, b) => a.due_at - b.due_at)
 							.slice(0, limit)
-							.map((r) => ({ id: r.id, telegram_user_id: r.telegram_user_id, message: r.message }));
+							.map((r) => ({
+								id: r.id,
+								telegram_user_id: r.telegram_user_id,
+								message: r.message,
+								attempt_count: r.attempt_count,
+							}));
 						return { results: rows as T[] };
 					}
 					return { results: [] as T[] };
@@ -221,6 +257,13 @@ test("hourly delays are converted to minutes (two hours = 120)", async () => {
 	assert.match(reply, /2 ساعت/);
 });
 
+test("delay label keeps exact hours and minutes (90 minutes = 1 ساعت و 30 دقیقه)", async () => {
+	const state = baseState();
+	const reply = await executeReminder({ DB: makeD1(state) } as never, USER, reminderIntent({ delay_minutes: 90 }) as never, NOW_MS);
+	assert.equal(state.reminders[0].due_at, NOW + 5400);
+	assert.match(reply, /1 ساعت و 30 دقیقه/);
+});
+
 test("invalid delays are rejected without creating a reminder", async () => {
 	for (const delay_minutes of [0, -5, 1.5, 43_201, null]) {
 		const state = baseState();
@@ -278,7 +321,7 @@ test("a reminder claimed by a concurrent run is skipped via CAS (no double deliv
 	assert.equal(state.reminders[0].status, "claimed");
 });
 
-test("telegram failure releases the claim for retry and never marks sent", async (t) => {
+test("telegram failure schedules a linear backoff retry and never marks sent", async (t) => {
 	const state = baseState();
 	seed(state, { message: "شکست", due_at: NOW - 5 });
 	state.telegramOk = false;
@@ -287,13 +330,60 @@ test("telegram failure releases the claim for retry and never marks sent", async
 	const stats = await deliverDueReminders({ DB: d1, TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS);
 	assert.deepEqual(stats, { sent: 0, failed: 1, skipped: 0 });
 	assert.equal(state.reminders[0].status, "pending");
+	assert.equal(state.reminders[0].attempt_count, 1);
+	assert.equal(state.reminders[0].next_attempt_at, NOW + 60);
 	assert.equal(state.reminders[0].sent_at, null);
 
+	// Before the backoff elapses the reminder is not even selected:
+	const early = await deliverDueReminders({ DB: d1, TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS);
+	assert.equal(early.sent, 0);
+	assert.equal(state.telegramCalls.length, 1);
+
 	state.telegramOk = true;
-	const stats2 = await deliverDueReminders({ DB: d1, TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS);
+	// After the backoff elapses exactly one retry happens:
+	const stats2 = await deliverDueReminders({ DB: d1, TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS + 60_000);
 	assert.equal(stats2.sent, 1);
 	assert.equal(state.reminders[0].status, "sent");
+	assert.equal(state.reminders[0].attempt_count, 1);
 	assert.equal(state.telegramCalls.length, 2); // exactly one retry — no duplicate sends
+});
+
+test("reminders stop retrying after 5 failed attempts and are marked failed", async (t) => {
+	const state = baseState();
+	seed(state, { message: "ناتمام", due_at: NOW - 5, attempt_count: 4 });
+	state.telegramOk = false;
+	mockTelegram(t, state);
+	const stats = await deliverDueReminders({ DB: makeD1(state), TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS);
+	assert.deepEqual(stats, { sent: 0, failed: 1, skipped: 0 });
+	assert.equal(state.reminders[0].status, "failed");
+	assert.equal(state.reminders[0].attempt_count, 5);
+	assert.equal(state.reminders[0].next_attempt_at, null);
+	assert.equal(state.telegramCalls.length, 1);
+
+	// A failed reminder is never retried again, no matter how much time passes:
+	const stats2 = await deliverDueReminders({ DB: makeD1(state), TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS + 3_600_000);
+	assert.deepEqual(stats2, { sent: 0, failed: 0, skipped: 0 });
+	assert.equal(state.telegramCalls.length, 1);
+	assert.equal(state.reminders[0].status, "failed");
+});
+
+test("fresh claims within the 16-minute threshold are left alone (Cron may run 15 minutes)", async (t) => {
+	const state = baseState();
+	seed(state, { message: "در حال ارسال", due_at: NOW - 900, status: "claimed", claimed_at: NOW - 900 });
+	mockTelegram(t, state);
+	const stats = await deliverDueReminders({ DB: makeD1(state), TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS);
+	assert.equal(stats.sent, 0);
+	assert.equal(state.telegramCalls.length, 0);
+	assert.equal(state.reminders[0].status, "claimed");
+});
+
+test("stale claims older than 16 minutes are recovered and delivered", async (t) => {
+	const state = baseState();
+	seed(state, { message: "گمشده", due_at: NOW - 1000, status: "claimed", claimed_at: NOW - 961 });
+	mockTelegram(t, state);
+	const stats = await deliverDueReminders({ DB: makeD1(state), TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS);
+	assert.equal(stats.sent, 1);
+	assert.equal(state.reminders[0].status, "sent");
 });
 
 test("reminders of unauthorized users are cancelled without any Telegram call", async (t) => {
@@ -305,15 +395,6 @@ test("reminders of unauthorized users are cancelled without any Telegram call", 
 	assert.equal(stats.skipped, 1);
 	assert.equal(state.telegramCalls.length, 0);
 	assert.equal(state.reminders[0].status, "cancelled");
-});
-
-test("stale claims from dead runs are recovered and delivered", async (t) => {
-	const state = baseState();
-	seed(state, { message: "گمشده", due_at: NOW - 400, status: "claimed", claimed_at: NOW - 600 });
-	mockTelegram(t, state);
-	const stats = await deliverDueReminders({ DB: makeD1(state), TELEGRAM_BOT_TOKEN: "test-token" } as never, NOW_MS);
-	assert.equal(stats.sent, 1);
-	assert.equal(state.reminders[0].status, "sent");
 });
 
 test("not-yet-due reminders are left untouched", async (t) => {

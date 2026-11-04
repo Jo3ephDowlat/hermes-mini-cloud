@@ -6,16 +6,20 @@
 -- status lifecycle:
 --   pending  -> claimed -> sent        (normal delivery)
 --   pending  -> cancelled              (owner no longer authorized; never sent)
---   claimed  -> pending                (delivery failed, or stale claim recovered)
+--   claimed  -> pending                (delivery failed: bounded retry via next_attempt_at)
+--   pending  -> failed                 (5 failed delivery attempts; never retried)
+--   claimed  -> pending                (stale claim recovered after 16 minutes)
 CREATE TABLE reminders (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     telegram_user_id TEXT NOT NULL,
     message          TEXT NOT NULL CHECK (length(trim(message)) > 0),
     due_at           INTEGER NOT NULL,
-    status           TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed', 'sent', 'cancelled')),
+    status           TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'claimed', 'sent', 'cancelled', 'failed')),
     created_at       INTEGER NOT NULL,
     claimed_at       INTEGER,
-    sent_at          INTEGER
+    sent_at          INTEGER,
+    attempt_count    INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at  INTEGER
 );
 
 -- Delivery scan: due pending reminders, oldest first.
