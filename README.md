@@ -288,7 +288,3 @@ We develop on Windows 10 using a remote-build workflow — Wrangler is **not** r
 
 Secrets are set once in the Cloudflare dashboard / via `wrangler secret put` and are read from
 `env` at runtime.
-## Persian voice messages
-
-Hermes accepts Telegram voice notes up to 60 seconds. It downloads the voice file using Telegram's `getFile` API, transcribes the audio with Cloudflare Workers AI Whisper (`@cf/openai/whisper`), then sends the resulting Persian text through the same message-processing pipeline used for ordinary text messages. Voice notes are subject to Telegram Bot API's 20 MB `getFile` download limit. No additional D1 migration or Worker binding is required; the existing Workers AI API token is reused.
-
