@@ -1,290 +1,205 @@
-# hermes-mini-cloud
+# Hermes Mini Cloud
 
-Persian AI Telegram Assistant on Cloudflare Workers — a university Cloud Computing project.
+> A serverless Persian Telegram assistant that turns free-form messages into safe task actions and reliable reminders.
 
-## Project Purpose
+`Hermes Mini Cloud` is a Cloud Computing course project built on Cloudflare Workers and D1. It has no always-on server, no Docker container, and no slash-command interface: users write naturally in Persian and the assistant decides what they mean, while application code remains responsible for every security-sensitive decision.
 
-hermes-mini-cloud is a serverless Persian-language AI task assistant delivered through a Telegram bot,
-running entirely on [Cloudflare Workers](https://developers.cloudflare.com/workers/) with a
-[Cloudflare D1](https://developers.cloudflare.com/d1/) database — no traditional server to manage.
+## What the user experiences
 
-## Current Status
+| You write in Persian | Hermes does |
+| --- | --- |
+| `برای خرید شیر یک کار بساز` | Adds a task |
+| `کارهای من چیه؟` | Lists open tasks |
+| `شیر را خریدم` | Marks the matching task done |
+| `همه کارها را حذف کن` | Asks for explicit confirmation first |
+| `ده دقیقه دیگه یادم بنداز به مامان زنگ بزنم` | Creates a persistent reminder |
+| `سلام، حالت چطوره؟` | Replies conversationally in Persian |
 
-- [x] Initial project scaffold (Worker entry point, Wrangler config, TypeScript config)
-- [x] Database (D1) — schema and runtime migrations
-- [x] Telegram webhook (secret-token verification, allow-list, duplicate protection)
-- [x] Task management — add / done / undone / del / list / chat
-- [x] LLM intelligence (OpenAI-compatible Chat Completions, strict JSON contract)
-- [x] Conversation memory (per-user, persisted in D1)
-- [x] Destructive-action confirmation flow (delete-all)
-- [x] Natural-language reminders (v2, phase 1) — relative delays only; on this branch, not deployed
-- [ ] Persian UI polish & extra commands (future work)
+There are no `/add`, `/list`, or other slash commands. The language model proposes one structured intent; the Worker validates it and decides whether it is safe to execute.
+
+## Final scope
+
+- Free-form Persian task management: `add`, `done`, `undone`, `del`, `list`, and `chat`
+- Per-user conversation memory stored in D1
+- Multi-user D1 allow-list; unauthorized users are silently ignored
+- Secure Telegram webhook with a secret header and constant-time comparison
+- Idempotent update processing so Telegram redelivery cannot duplicate work
+- Safe clarification flow for ambiguous task references
+- Persistent relative-time reminders, delivered by a Cloudflare Cron Trigger
+- Tehran-aware date context for the LLM and reminder confirmation times
+- TypeScript regression tests for the two highest-risk areas: ambiguous mutations and reminder delivery
+
+Voice transcription was intentionally reverted from `main`; it is not part of the final supported feature set.
 
 ## Architecture
 
-```
-Telegram  ──POST /telegram/webhook──▶  Cloudflare Worker (src/index.ts)
-                                          │  1. verify secret token header
-                                          │  2. whitelist check (authorized_users)
-                                          │  3. claim update_id (dedup in D1)
-                                          │  4. check pending confirmation
-                                          │  5. load history + task candidates
-                                          │  6. call LLM (JSON contract)
-                                          │  7. validate → execute in D1
-                                          │  8. save messages, reply via Bot API
-D1 (hermes-mini-db)  ◀────── DB binding ──┘
-OpenAI-compatible API ◀──── LLM_API_URL ─┘
+```mermaid
+flowchart LR
+  U[Telegram user] --> T[Telegram Bot API]
+  T -->|POST /telegram/webhook + secret header| W[Cloudflare Worker]
+  W -->|authorize, deduplicate, validate| D[(Cloudflare D1)]
+  W -->|structured prompt| L[OpenAI-compatible LLM API]
+  L -->|one JSON intent| W
+  W -->|sendMessage| T
+  C[Cloudflare Cron\nevery minute] --> W
+  W -->|due reminders| T
 ```
 
-Core Worker logic lives in a single file, `src/index.ts`. No frameworks are used — only the
-Workers runtime, `fetch`, and D1 prepared statements.
+### Why these choices?
 
-## Technologies
+| Decision | Reason |
+| --- | --- |
+| Webhook, not polling | The Worker runs only when Telegram sends an update; it does not keep a process alive asking for new messages. |
+| Serverless / FaaS | The workload is short and event-driven, so Workers remove server maintenance and fit the course free-plan constraint. |
+| D1, not KV | Tasks, history, confirmations, authorizations, and reminders need relational queries, ordering, indexes, and transactions. |
+| D1 for state | A Worker is stateless between requests. Persistent state therefore belongs in the database, not memory. |
+| LLM proposes; code executes | Language understanding is useful, but the model never receives direct database authority. |
 
-| Technology | Role |
-|---|---|
-| Cloudflare Workers | Serverless compute platform (edge runtime) |
-| Cloudflare D1 | Serverless SQLite database (binding name: `DB`) |
-| Wrangler 4.x | Cloudflare's CLI for migrations & deployment |
-| TypeScript (strict) | Type-safe JavaScript |
-| OpenAI-compatible Chat Completions API | Persian conversational intelligence |
+## Message lifecycle
 
-## Environment Variables and Secrets
+1. Telegram calls `POST /telegram/webhook` with its shared secret header.
+2. The Worker rejects a missing or invalid secret with `403`.
+3. It accepts only private messages from active entries in `authorized_users`.
+4. `processed_updates` atomically claims the Telegram `update_id`, preventing duplicate processing.
+5. The Worker checks pending deletion confirmations and pending task clarifications first.
+6. It loads the user's recent history and owned task candidates, then requests one JSON intent from the LLM.
+7. The JSON is parsed and validated. Invalid output produces a safe Persian fallback with no database write.
+8. Valid actions use parameterized D1 queries, then the Worker stores the exchange and replies through Telegram.
 
-The five runtime settings are split into two categories:
+## Safety model
+
+### The model suggests; the Worker decides
+
+The LLM can only return one action from a fixed allow-list. It cannot run SQL, call Telegram, choose an arbitrary URL, or bypass ownership checks. In particular:
+
+- A malformed JSON response causes no state change.
+- Every task mutation is re-scoped to `telegram_user_id` in SQL.
+- A model-provided `task_id` never authorizes a mutation by itself.
+- The user's wording must deterministically identify a unique title or a number actually shown in a recent task list.
+- Ambiguity creates a 10-minute, per-user clarification snapshot. The next answer is resolved in code against that snapshot, not sent back to the LLM as a new instruction.
+- Deleting all tasks always requires an explicit Persian confirmation; a cancellation or unrelated reply aborts it.
+
+### Webhook and data security
+
+- `X-Telegram-Bot-Api-Secret-Token` is verified with a constant-time comparison.
+- Only active D1 allow-list entries are processed. Unauthorized messages receive no reply and create no stored data.
+- All queries use bound parameters.
+- Secret values never belong in the repository or `wrangler.jsonc`.
+- Error logging records only error identity, never secrets or message text.
+
+## Reminder reliability
+
+The `remind` intent supports explicit relative Persian durations such as `دو دقیقه دیگه` or `یک ساعت و 30 دقیقه دیگه`.
+
+- Duration parsing is deterministic in Worker code; the model's claimed delay is not trusted.
+- The reminder stores a UTC Unix timestamp in D1, then its confirmation shows the approximate Tehran time.
+- A `* * * * *` Cron Trigger scans up to 20 due reminders per invocation.
+- A compare-and-set claim prevents two Cron executions from sending the same reminder concurrently.
+- A failed Telegram delivery retries with linear backoff. After five failures, the reminder is marked `failed` instead of retrying forever.
+- Claims abandoned for more than 16 minutes are recovered safely and count toward that bounded retry budget.
+- A reminder for a revoked user is cancelled without a Telegram call.
+
+## Technology stack
+
+| Component | Purpose |
+| --- | --- |
+| Cloudflare Workers | Serverless TypeScript runtime and webhook endpoint |
+| Cloudflare D1 | Persistent SQLite database |
+| Cloudflare Cron Triggers | Scheduled reminder delivery |
+| Telegram Bot API | User interface, webhook source, and response delivery |
+| OpenAI-compatible Chat Completions API | Persian language understanding and conversational replies |
+| Wrangler | Cloudflare deployment and D1 migration CLI |
+| Node test runner + TypeScript | Regression testing and static type checking |
+
+## Database model
+
+| Table | Responsibility |
+| --- | --- |
+| `tasks` | User-owned tasks, completion state, optional date, and idempotent creation source |
+| `conversation_messages` | Short per-user conversation memory; pruned to the newest 30 messages |
+| `authorized_users` | Active Telegram-user allow-list |
+| `processed_updates` | Telegram update deduplication |
+| `pending_confirmations` | Expiring delete-all confirmations |
+| `pending_clarifications` | Expiring deterministic snapshots for ambiguous task actions |
+| `reminders` | Scheduled reminder lifecycle, claims, retries, and delivery state |
+
+Schema changes are versioned in `migrations/`. Applied migration files are immutable: a new change always receives a new numbered file.
+
+## Configuration
 
 ### Secrets
 
-Set once with `wrangler secret put <NAME>` (or in the Cloudflare dashboard). **None of them are
-stored in this repository or in `wrangler.jsonc`.**
+Set these in Cloudflare's secret store or with `wrangler secret put <NAME>`:
 
 | Secret | Purpose |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Bot token used to send replies via the Telegram Bot API |
-| `TELEGRAM_WEBHOOK_SECRET` | Shared secret Telegram echoes in `X-Telegram-Bot-Api-Secret-Token` |
-| `LLM_API_KEY` | Bearer key for the LLM provider |
+| --- | --- |
+| `TELEGRAM_BOT_TOKEN` | Sends replies through the Telegram Bot API |
+| `TELEGRAM_WEBHOOK_SECRET` | Shared secret verified on each webhook request |
+| `LLM_API_KEY` | Bearer credential for the configured LLM provider |
 
-### Plain-text Variables
+### Plain variables
 
-Stored under `vars` in `wrangler.jsonc` and deployed with the Worker — they are configuration, not
-credentials, so they are safe to keep in the repository:
+The non-secret configuration lives in `wrangler.jsonc`:
 
 | Variable | Purpose |
-|---|---|
-| `LLM_API_URL` | **Full** Chat Completions endpoint URL (Cloudflare Workers AI) |
-| `LLM_MODEL` | Model name to request from the provider (e.g. `@cf/qwen/qwen3-30b-a3b-fp8`) |
+| --- | --- |
+| `LLM_API_URL` | Full OpenAI-compatible Chat Completions endpoint |
+| `LLM_MODEL` | Model identifier sent to the provider |
 
-Note: there is no user-ID secret anymore — authorized users are managed in the D1
-`authorized_users` whitelist (see below).
+The D1 binding is named `DB`; the repository never contains secret values.
 
-## HTTP Endpoints
+## Endpoints
 
-| Method | Path | Description |
-|---|---|---|
-| GET | `/` | Welcome JSON response |
-| GET | `/health` | Service health: `{ "ok": true, "service": "hermes-mini-cloud", "status": "running" }` |
-| GET | `/health/db` | D1 health check (`SELECT 1 AS ok`); 200 when connected, 503 on failure |
-| POST | `/telegram/webhook` | Telegram updates; 403 without a valid secret header, 200 otherwise |
-| * | any other path | JSON 404 error |
+| Method | Path | Result |
+| --- | --- | --- |
+| `GET` | `/` | Service metadata |
+| `GET` | `/health` | Worker health JSON |
+| `GET` | `/health/db` | D1 connectivity check; `503` if unavailable |
+| `POST` | `/telegram/webhook` | Telegram update endpoint; `403` for a bad secret |
 
-## Webhook Security
+## Local quality checks
 
-1. Telegram sends `X-Telegram-Bot-Api-Secret-Token`; it is compared to `TELEGRAM_WEBHOOK_SECRET` using
-   a constant-time comparison. Missing or wrong → `403`.
-2. Only **private text messages** from users listed in the D1 `authorized_users` whitelist with
-   `is_active = 1` are processed; everyone else is silently ignored (HTTP 200, no state change, no
-   reply, nothing stored).
-3. Idempotency & safe retries: each processable update from an authorized user is claimed in
-   `processed_updates` with `INSERT OR IGNORE` — duplicate deliveries return 200 immediately. If
-   processing fails **before any user-data mutation** (whitelist query, LLM timeout, transient D1
-   error), the claim is released and the Worker answers 500 so Telegram redelivers. Once an action
-   has executed, the claim is kept (at-most-once for actions) and post-mutation history writes are
-   failure-tolerant, so a retry can never repeat an executed action. As a second layer, **task
-   creation is idempotent per update**: every task stores the Telegram `update_id` that created it
-   in `tasks.source_update_id` (unique index). If a redelivered update ever reaches `add` again,
-   the insert is a no-op (`ON CONFLICT DO NOTHING`) and the user gets a Persian "already processed"
-   reply instead of a duplicate task. The duplicate-check lookup is scoped by `telegram_user_id`.
-   `done`/`undone`/`del`/`list` are naturally repeatable; the update claim remains the primary
-   guard for all actions.
-4. Malformed JSON bodies are acknowledged with 200 (stopping retry storms) and discarded.
-5. No message contents or secrets are ever logged; only error identities reach `console.error`.
-6. All SQL uses D1 prepared statements with bound parameters — user input is never interpolated.
-7. The LLM prompt marks user text as data, and every LLM-suggested field is validated before any
-   database write; an invalid JSON/action yields a safe Persian fallback with no DB changes.
-
-## Task Actions
-
-| Action | Behavior |
-|---|---|
-| `add` | Inserts a task with title and optional validated `due_date` (Gregorian `YYYY-MM-DD`) |
-| `done` | Marks a task completed; sets `completed_at` and `updated_at` (ownership verified) |
-| `undone` | Restores a task; clears `completed_at`, updates `updated_at` (ownership verified) |
-| `del` | Deletes one task by verified id; **delete-all** always requires explicit confirmation |
-| `list` | Numbers open tasks consistently (1-based, by creation order); completed tasks shown when explicitly requested |
-| `chat` | Natural Persian conversational reply |
-
-Task references like "number 3" or "the milk task" are resolved by the LLM against the numbered
-candidate list (real task ids) and the conversation history. Ambiguous references set
-`needs_clarification` and the bot asks a Persian clarifying question instead of guessing. Every
-`task_id` is re-verified against `telegram_user_id` in SQL before any update or delete, so one user
-can never affect another user's tasks.
-
-**Deterministic mutation guard (v1.1).** For `done`/`undone`/`del` the model's `task_id` is never
-trusted on its own: the user's own message must deterministically identify the task — a unique
-title match, or a position from a numbered list that was actually displayed to that user in recent
-conversation history (pending-list and completed-section markers are detected in stored history).
-Vague phrases like «اون تسک دانشگاهی» never mutate anything; they open a stored clarification
-instead.
-
-**Stored clarifications (v1.1).** When `done`/`undone`/`del` is ambiguous, the requested action and
-a numbered snapshot of the user's own tasks are saved in `pending_clarifications` (10-minute
-expiry, one row per user). The next message is resolved **deterministically in code** against that
-snapshot — it never reaches the LLM as a new instruction: an explicit title is matched only against
-the snapshot (a title that does not exist never falls back to a position or another task); several
-matches re-ask with the matching subset; a position is accepted only if that exact numbered list
-was displayed in the bot's clarification message; cancellation («انصراف») clears the state without
-executing. Before executing, the selected task is re-verified to still exist and belong to the same
-user. A clarification reply can never switch the stored action.
-
-**Clarification retry safety (v1.1).** The task mutation and the pending-state cleanup run in one
-D1 `batch` (a single transaction): if the mutation fails, the cleanup rolls back with it, so the
-pending clarification survives and Telegram's redelivery re-resolves the same choice. `done` /
-`undone` are idempotent and a retried `del` matches zero rows, so a retry can never apply a
-duplicate mutation. If the selected task no longer exists (or is no longer owned by the user), the
-pending state is cleared safely and nothing is executed.
-
-## Natural-Language Reminders (v2 — phase 1)
-
-Persian relative-time reminders («ده دقیقه دیگه یادآوری کن آب بخورم») are created through a new
-`remind` LLM action:
-
-- The model returns `reminder_text` and `delay_minutes` (relative minutes/hours only). The Worker
-  validates both strictly (non-empty text ≤ 500 chars; integer delay 1–43200 minutes) and computes
-  the due moment itself as a **UTC Unix timestamp** — never inside the LLM. Invalid or ambiguous
-  requests fail safely with a Persian message and no database write.
-- Reminders are stored in the D1 `reminders` table with status `pending`; the bot confirms in
-  Persian with the reminder text and the approximate Tehran delivery time.
-- A Cloudflare Cron Trigger (`* * * * *`) runs the Worker's `scheduled()` handler: it requeues
-  claims left stale by dead runs (older than 5 minutes), selects up to 20 due reminders, atomically
-  claims each row (compare-and-set `UPDATE … WHERE status = 'pending'`), verifies the owner is
-  still on the `authorized_users` whitelist, and sends «⏰ یادآوری: …» via the Telegram Bot API.
-- Status becomes `sent` (with `sent_at`) only after a successful Telegram API response; failures
-  release the claim back to `pending` for the next run. Concurrent runs can never double-deliver,
-  and there is no public HTTP endpoint that can trigger delivery.
-
-## Conversation Memory
-
-- Both user and assistant messages are stored in `conversation_messages`.
-- The latest **12** messages are sent to the LLM with every request, so context persists between requests.
-- Stored history is pruned to the most recent **30** messages per user after each reply.
-
-## Destructive-Action Safety (delete-all)
-
-- "Delete all tasks" never executes immediately: it is stored in `pending_confirmations` and the bot
-  asks (in Persian) for explicit confirmation.
-- Writing «بله» (yes) executes; «انصراف» / «نه» (cancel/no) aborts; any other message implicitly
-  cancels the pending operation.
-- Pending confirmations expire after **10 minutes** (`expires_at`, checked in SQL) and are purged
-  opportunistically.
-- Single-task deletion additionally requires a uniquely identified, existing, owned task.
-
-## User Whitelist (`authorized_users`)
-
-The bot is **not public**. Authorization is enforced against the `authorized_users` table in D1
-(migration `0002`): a message is processed only when its sender's `telegram_user_id` exists in the
-table with `is_active = 1`. Unauthorized users are silently ignored — no reply, no history, no state.
-
-To grant access, run this in the **D1 Console** (Cloudflare dashboard → hermes-mini-db → Console),
-replacing `TELEGRAM_ID` with the user's numeric Telegram ID:
-
-```sql
-INSERT INTO authorized_users (telegram_user_id, display_name, is_active)
-VALUES ('TELEGRAM_ID', 'Professor', 1);
+```powershell
+# PowerShell may require the .cmd form when script execution is restricted.
+npm.cmd test
+npm.cmd run typecheck
 ```
 
-To temporarily revoke access (the row and its history remain, but the user can no longer use the bot):
+The test suite covers deterministic clarification safety, cross-user isolation, retry-safe mutation, Persian duration parsing, reminder persistence, concurrent Cron claims, bounded retries, stale-claim recovery, and authorization changes.
 
-```sql
-UPDATE authorized_users SET is_active = 0 WHERE telegram_user_id = 'TELEGRAM_ID';
+## Deployment and migrations
+
+```powershell
+# Inspect or apply D1 migrations against the configured remote database.
+npm.cmd run db:migrations:list:remote
+npm.cmd run db:migrations:apply:remote
+
+# Deploy the Worker when the Cloudflare project is configured.
+npm.cmd run deploy
 ```
 
-To restore access later, set `is_active = 1` again; to remove a user permanently, `DELETE` the row.
-Changes take effect on the user's next message — no redeploy needed.
+Set the Telegram webhook to the deployed Worker URL plus `/telegram/webhook`, using the exact same secret stored in `TELEGRAM_WEBHOOK_SECRET`.
 
-## Multi-User Data Isolation
+## Project layout
 
-Every table is keyed by `telegram_user_id`, and every query that reads or writes user data is scoped
-to the caller's ID with a **bound parameter** — never string interpolation:
-
-- **`tasks`** — every `SELECT`/`UPDATE`/`DELETE` filters by `id = ? AND telegram_user_id = ?`; a task
-  id belonging to another user matches zero rows, so the action is refused, never applied.
-- **`conversation_messages`** — history is loaded, written and pruned per user only.
-- **`pending_confirmations`** — keyed by `telegram_user_id` (primary key); delete-all removes only
-  `WHERE telegram_user_id = ?`.
-- The user ID always comes from the verified Telegram update, never from user-supplied content. The
-  LLM may only supply a `task_id`, which is re-verified against the caller's ID in SQL before any
-  mutation. Positional references ("شماره ۳") are resolved against the same numbered list the user
-  sees (pending 1..n, completed continuing n+1), and the model is forbidden from inventing ids.
-  A completed task may be referenced positionally only if a recent assistant message actually
-  displayed the numbered completed-task list (detected in conversation history); otherwise the
-  model must resolve it by title or ask for clarification.
-
-## Database (Cloudflare D1)
-
-| Setting | Value |
-|---|---|
-| Binding | `DB` |
-| Database name | `hermes-mini-db` |
-| Config file | `wrangler.jsonc` (`d1_databases`) |
-| Migrations directory | `migrations/` |
-
-### Schema
-
-- **`tasks`** — todo items per Telegram user (`0001_initial_schema.sql`), plus nullable
-  `source_update_id` (the Telegram `update_id` that created the task, with a unique index — added
-  by migration `0002` so a redelivered update can never create a duplicate task).
-- **`conversation_messages`** — chat history per user (`0001`).
-- **`authorized_users`** — restricted whitelist of Telegram users (`0002_telegram_runtime.sql`).
-- **`processed_updates`** — Telegram `update_id` deduplication (`0002_telegram_runtime.sql`).
-- **`pending_confirmations`** — one pending delete-all per user with expiry (`0002`).
-- **`pending_clarifications`** — one stored clarification (action + candidate snapshot) per user
-  with expiry, for ambiguous `done`/`undone`/`del` (`0003_pending_clarifications.sql`).
-- **`reminders`** — persistent reminders with UTC Unix due timestamps and claim-based delivery
-  (`0004_reminders.sql`).
-
-### Migration Workflow
-
-Migration files live in `migrations/`, versioned by filename prefix. Wrangler is not run locally
-(see Development below); migrations are applied remotely:
-
-```bash
-npm run db:migrations:list:remote    # list pending/known migrations (remote D1)
-npm run db:migrations:apply:remote   # apply unapplied migrations (remote D1)
+```text
+src/index.ts                         Worker, LLM contract, webhook, task and reminder logic
+migrations/0001_initial_schema.sql   Tasks and conversation history
+migrations/0002_telegram_runtime.sql Runtime security, authorization, and idempotency
+migrations/0003_pending_clarifications.sql  Deterministic ambiguity handling
+migrations/0004_reminders.sql        Reminder persistence and lifecycle
+tests/clarification.test.ts          Mutation and clarification regression tests
+tests/reminders.test.ts              Reminder delivery regression tests
+wrangler.jsonc                       Worker, D1, Cron, and non-secret configuration
 ```
 
-Cloudflare tracks applied migrations, so `apply` is idempotent. Never modify an already-applied
-migration — add a new `000N_*.sql` file instead.
+## Known boundaries
 
-### Date & Time Conventions
+- Reminders intentionally accept explicit relative minutes or hours, not absolute calendar-time requests.
+- Cron delivery has minute-level scheduling granularity, so a reminder is expected around its due minute rather than at sub-minute precision.
+- The system is deliberately an allow-listed personal assistant, not a public multi-tenant Telegram bot.
+- The LLM is an interpretation layer, not a source of truth; every state-changing decision is constrained by application code.
 
-- **Timestamps** (`created_at`, `updated_at`, `completed_at`, `processed_at`, …) are stored as **UTC**
-  (D1 `CURRENT_TIMESTAMP` / `datetime('now')`).
-- **`due_date`** stores a **Gregorian** ISO date string (`YYYY-MM-DD`), validated as a real calendar
-  date in application code (not just a matching string).
-- The authoritative calendar timezone is **Asia/Tehran**: "today" is computed with `Intl` APIs using
-  `timeZone: "Asia/Tehran"`, never the server timezone. Both Gregorian and Jalali (Persian) dates are
-  provided to the LLM as context; relative dates like «فردا» are resolved by the model against this
-  context and re-validated by the Worker before storage.
+---
 
-## Development
-
-We develop on Windows 10 using a remote-build workflow — Wrangler is **not** run locally:
-
-1. **Edit locally** — code is written and edited with ZCode and VS Code.
-2. **Typecheck** — `npm run typecheck` (`tsc --noEmit`).
-3. **Push to GitHub** — changes are committed and pushed to this repository.
-4. **Cloudflare Workers Builds deploys** — Cloudflare connects to the GitHub repo, installs
-   dependencies, and builds/deploys the Worker automatically on every push.
-
-Secrets are set once in the Cloudflare dashboard / via `wrangler secret put` and are read from
-`env` at runtime.
+Built for the Cloud Computing course - focused on observable serverless design, safe LLM integration, and reliable state management.
